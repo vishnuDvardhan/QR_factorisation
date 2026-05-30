@@ -328,7 +328,8 @@ sim-rowmajor-wy: rowmajor-wy cfgs $(INPARAMS_RM_FILE)
 #   build all:        make variants
 # =============================================================================
 VARIANTS = v1_hvx_reduction v2_hvx_pivot v3_persistent_hvx \
-           v4_adaptive_chunk v5_dag_pipeline v6_combined
+           v4_adaptive_chunk v5_dag_pipeline v6_combined \
+           v7_dag_hvx_sched
 
 VARIANT_TARGETS = $(addprefix $(HEXAGON_DIR)/,$(VARIANTS))
 

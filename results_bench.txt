@@ -1,0 +1,18 @@
+# E1 head-to-head @ m=640 n=64 chunk=4
+colmajor_mt nt=4           | QR cycles:        1635916
+v0_pool nt=4               | [alg] pool_hh_unblocked             ... 630569 cycles  |  max |R|-err: 2.060e-04  OK
+v7_barrier nt=4            | [alg] dag_hvx_sched [barrier] ... 567798 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+v7_async_prio nt=4         | [alg] dag_hvx_sched [async_prio] ... 1014442 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 5.218e-07 OK
+v7_async_prio nt=3         | [alg] dag_hvx_sched [async_prio] ... 486553 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+# E3 nt sweep (v7 async_prio vs v0_pool)
+v0_pool nt=1               | [alg] pool_hh_unblocked             ... 1244001 cycles  |  max |R|-err: 2.060e-04  OK
+v7_async_prio nt=1         | [alg] dag_hvx_sched [async_prio] ... 859956 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+v0_pool nt=2               | [alg] pool_hh_unblocked             ... 817203 cycles  |  max |R|-err: 2.060e-04  OK
+v7_async_prio nt=2         | [alg] dag_hvx_sched [async_prio] ... 564410 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+v0_pool nt=4               | [alg] pool_hh_unblocked             ... 630087 cycles  |  max |R|-err: 2.060e-04  OK
+v7_async_prio nt=4         | [alg] dag_hvx_sched [async_prio] ... 933644 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+v0_pool nt=6               | [alg] pool_hh_unblocked             ... 685033 cycles  |  max |R|-err: 2.060e-04  OK
+v7_async_prio nt=6         | [alg] dag_hvx_sched [async_prio] ... 598943 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+v0_pool nt=8               | [alg] pool_hh_unblocked             ... 719837 cycles  |  max |R|-err: 2.060e-04  OK
+v7_async_prio nt=8         | [alg] dag_hvx_sched [async_prio] ... 594832 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+ALL DONE
