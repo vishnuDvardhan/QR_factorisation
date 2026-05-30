@@ -1,0 +1,10 @@
+Starting sweep of 8 runs. Output -> /home/vishnu/QR_factorisation/results/sweep.csv
+  colmajor m= 128 n= 128 nt=4 nb=  1 | unblk=   1169672 blk=   7106564 speed=0.1645  err=5.208217e-  True  (1346.2s)
+  colmajor m= 128 n= 128 nt=4 nb=  4 | unblk=   1169672 blk=   2822120 speed=0.4144  err=2.867743e-  True  (607.0s)
+  colmajor m= 128 n= 128 nt=4 nb=  8 | unblk=   1169672 blk=   2377715 speed=0.4919  err=3.217403e-  True  (508.7s)
+  colmajor m= 128 n= 128 nt=4 nb= 16 | unblk=   1169672 blk=   2679625 speed=0.4365  err=1.51293e-0  True  (499.9s)
+  rowmajor m= 128 n= 128 nt=4 nb=  1 | unblk=    972853 blk=  10883769 speed=0.0893  err=4.005432e-  True  (730.8s)
+  rowmajor m= 128 n= 128 nt=4 nb=  4 | unblk=    972853 blk=   6052729 speed=0.1607  err=4.25227e-0  True  (466.3s)
+  rowmajor m= 128 n= 128 nt=4 nb=  8 | unblk=    974265 blk=   4486442 speed=0.2171  err=4.215031e-  True  (413.1s)
+  rowmajor m= 128 n= 128 nt=4 nb= 16 | unblk=    972853 blk=   3566111 speed=0.2728  err=4.077889e-  True  (394.8s)
+done.

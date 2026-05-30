@@ -1,0 +1,81 @@
+Running pool variant (HH unblocked + persistent thread pool)...
+----- inparams.txt -----
+128 128 4 4 0 8
+------------------------
+hexagon-sim -mv69 --simulated_returnval --timing --usefs build/hexagon --pmu_statsfile build/hexagon/pmu_stats.txt --cosim_file build/hexagon/q6ss.cfg --l2tcm_base 0xd800 --subsystem_base 0xFC90 --rtos build/hexagon/osam.cfg /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.5.0.0/rtos/qurt/computev69/sdksim_bin/runelf.pbn -- build/hexagon/qr_pool_hh_unblocked
+hexagon-sim INFO: The rev_id used in the simulation is 0x01008c69 (v69na)
+Hexagon-sim INFO: Cosim /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.5.0.0/tools/HEXAGON_Tools/19.0.07/Tools/lib/iss/qtimer.so is loaded
+Hexagon-sim INFO: Cosim /local/mnt/workspace/Qualcomm/Hexagon_SDK/6.5.0.0/tools/HEXAGON_Tools/19.0.07/Tools/lib/iss/l2vic.so is loaded
+hexagon-sim INFO: DRIL::PluginOSAM in dril.cpp:9026: new style init-osam not available, go back to old way.
+Failed to unlock ETM base TLB entryQURT kernel started
+QURT kernel init cache params
+Wrong L2 cache parameters. Need to fix L2 cache sets and ways in cust config xml!!!! 
+QURT root task started
+QuRTOS heap init: start c0150ca0 size 0x80000
+Qurtos mlog buffer count is : 0 
+Init memory pools...
+Found Virtual Pool in overrides. size 20, pool id 64
+Adding pages 0x00000040->0x000c0000 to Default Virtual pool.
+Adding pages 0x000c0500->0x000fe000 to Default Virtual pool.
+Found requested Pool ID in overrides. size 24, pool id 0
+DEFAULT_PHYSPOOL pool c015c540 island 0
+	0x00500d2000-->0x0050100000
+	0x0050600000-->0x00a0000000
+DRIVER_POOL pool c015ca70 island 0
+	0x00b0000000-->0x00f0000000
+	0x0028885000-->0x0028886000
+TCM_PHYSPOOL pool c015cfa0 island 0
+	0x00d8020000-->0x00d8040000
+	0x00d8200000-->0x00d8a00000
+	0x00d9000000-->0x00da000000
+ANGEL_POOL pool c015d4d0 island 0
+	0x0000000000-->0x0000001000
+64BITS_PHYSPOOL pool c015da00 island 0
+	0x01a8020000-->0x01b8020000
+64BITS_PHYSPOOL_36BITS pool c015df30 island 0
+	0x0aa8020000-->0x0ab8020000
+init static mapping: ppn 0x000d8020, vpn 0x000d8020, pages 0x00000010
+init static mapping: ppn 0x000d8030, vpn 0x000d8030, pages 0x00000010
+init static mapping: ppn 0x001a8180, vpn 0x000a8180, pages 0x00000040
+init static mapping: ppn 0x00aa8180, vpn 0x000b8180, pages 0x00000040
+init static mapping: ppn 0x000d8200, vpn 0x000d8200, pages 0x00000100
+init static mapping: ppn 0x000d8300, vpn 0x000d8300, pages 0x00000100
+init static mapping: ppn 0x000d8400, vpn 0x000d8400, pages 0x00000400
+init static mapping: ppn 0x000d8800, vpn 0x000d8800, pages 0x00000100
+init static mapping: ppn 0x000d8900, vpn 0x000d8900, pages 0x00000100
+init static mapping: ppn 0x000d9000, vpn 0x000d9000, pages 0x00001000
+init static mapping: ppn 0x000b0000, vpn 0x000b0000, pages 0x00000001
+init static mapping: ppn 0x000fc000, vpn 0x000fc000, pages 0x00001000
+init static mapping: ppn 0x000b1000, vpn 0x000b1000, pages 0x00000004
+init static mapping: ppn 0x00028885, vpn 0x00028885, pages 0x00000001
+finished static mem
+adding 0 -- c0000000 range to user reservations pool 
+App Images Init
+QURT system-clock daemon started
+QURT Timer service was initialized.
+qurt_cb_fwk_worker_init returned: -4
+Entering main() ...
+Debugging can be done using debug monitor/stub
+Make sure to provide the debugger cosim in the config file
+Adding pages 0x00000040->0x000fe000 to Default Virtual pool for asid 1
+user: Time taken for process spawning in ms 1616 
+User malloc mapping for User process successful
+vaddr 0xf8bc0000, paddr 0xffffffff, size 0x500f0000, mode 0x0, perms 0x10000
+Start user reaper thread for process with PID: 0x2
+QURT Timer service was initialized.
+qurt_cb_fwk_worker_init returned: -4
+Entering main() ...
+=== pool_hh_unblocked ===
+Matrix: 128 x 128  |  Threads: 4  |  Chunk: 4  |  nb: 8
+
+[ref] CPU scalar Householder        ... 3805106 cycles
+[alg] pool_hh_unblocked             ... 341772 cycles  |  max |R|-err: 1.717e-05  OK
+
+Done!
+	T0: Insns=2615245 Packets=976057
+	T1: Insns=146809 Packets=61518
+	T2: Insns=124953 Packets=53620
+	T3: Insns=10699138 Packets=3171784
+	T4: Insns=158783 Packets=67305
+	T5: Insns=36440 Packets=15503
+	Total: Insns=13781368 Pcycles=9415040

@@ -1,0 +1,15 @@
+[1] CPU scalar Householder        ... 310716 cycles
+[2] HH unblocked HVX-MT           ... 677286 cycles  |  max |R|-err vs CPU: 1.907e-05  OK
+[3] HH WY-blocked HVX-MT          ... 263405 cycles  |  max |R|-err vs CPU: 1.144e-05  OK
+[4] MGS2 (re-ortho) HVX (1 thr)   ... 277078 cycles  |  max |R|-err vs CPU: 2.480e-05  OK
+[5] Givens rotations HVX (1 thr)  ... 451592 cycles  |  max |R|-err vs CPU: 1.907e-05  OK
+[6] Tile QR (2-way TSQR) HVX-MT   ... 1766510 cycles  |  max |R|-err vs CPU: 2.670e-05  OK
+
+Done!
+	T0: Insns=4254550 Packets=1667896
+	T1: Insns=1015113 Packets=447716
+	T2: Insns=406392 Packets=191218
+	T3: Insns=10677661 Packets=3004864
+	T4: Insns=132187 Packets=62177
+	T5: Insns=30025 Packets=12064
+	Total: Insns=16515928 Pcycles=10919283

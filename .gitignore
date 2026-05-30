@@ -1,0 +1,15 @@
+# Build artifacts
+build/hexagon/*.o
+build/hexagon/*.so
+build/hexagon/q6ss.cfg
+build/hexagon/osam.cfg
+build/hexagon/pmu_stats.txt
+# Compiled hexagon binaries (no extension)
+build/hexagon/qr_*
+build/hexagon/v1_hvx_reduction
+build/hexagon/v3_persistent_hvx
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

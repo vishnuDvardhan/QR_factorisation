@@ -1,0 +1,6 @@
+idx,name,cycles,err,status
+1,CPU scalar Householder,3410186,0.0,ref
+2,HH unblocked HVX-MT,1140982,1.717e-05,OK
+3,HH WY-blocked HVX-MT,1873034,2.48e-05,OK
+4,MGS2 (re-ortho) HVX (1 thr),4940553,3.624e-05,OK
+5,Givens rotations HVX (1 thr),1961711,4.005e-05,OK

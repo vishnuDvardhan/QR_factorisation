@@ -1,0 +1,105 @@
+// --- SHARED GLOBAL STATE ---
+Matrix A                         // The matrix being factorized (m x n)
+Array v                          // The Householder reflection vector
+Float tau                        // The Householder scalar
+Int current_k                    // The current column being processed
+Int total_rows_m                 // Matrix dimensions
+Int total_cols_n
+
+Signal done_master           
+Signal go[TOTAL_WORKERS]     
+AtomicInt done_count         
+AtomicInt chunk_counter      
+
+// =========================================================================
+
+// --- 1. THE MAIN THREAD (Scalar Math & Dispatcher) ---
+function main_thread():
+    
+    // Loop through every column in the matrix
+    for k from 0 to total_cols_n - 1:
+        
+        // --- SERIAL MATH: Compute Reflection Vector (v) and tau ---
+        norm_x = calculate_norm(A, column=k, start_row=k)
+        if norm_x is effectively zero:
+            continue // Skip to next column
+            
+        alpha = -sign(A[k,k]) * norm_x
+        
+        // Build the v vector
+        for i from 0 to k-1: v[i] = 0
+        for i from k to total_rows_m - 1: v[i] = A[i, k]
+        v[k] = v[k] - alpha
+        
+        norm_v = calculate_norm(v, start_row=k)
+        tau = 2.0 / (norm_v * norm_v)
+        
+        // --- PREPARE THE PARALLEL BATCH ---
+        current_k = k                     // Tell workers which column we are on
+        chunk_counter = 0                 // Reset work queue
+        done_count = TOTAL_WORKERS        // Reset finished-thread counter
+        
+        clear_signal(done_master)
+        
+        // Wake all workers
+        for i from 0 to TOTAL_WORKERS:
+            set_signal(go[i])             
+            
+        // Sleep and let the DSP crunch the trailing columns
+        wait_on_signal(done_master)       
+        
+        // --- FINALIZE CURRENT COLUMN ---
+        A[k,k] = alpha
+        for i from k+1 to total_rows_m - 1:
+            A[i, k] = 0.0
+
+// =========================================================================
+
+// --- 2. THE WORKER THREADS (HVX Trailing Matrix Update) ---
+function worker_thread(my_id):
+    while (true):
+        
+        wait_on_signal(go[my_id])         
+        clear_signal(go[my_id])           
+        
+     
+        
+        lock_hardware(HVX)
+        
+        while (true):
+            // --- DYNAMIC WORK CLAIMING ---
+            ci = atomic_increment(chunk_counter)
+            
+            // Calculate which matrix columns this chunk corresponds to
+            col_start = (current_k + 1) + (ci * CHUNK_SIZE)
+            
+            // If the start column is beyond the matrix, we are done
+            if (col_start >= total_cols_n):
+                break 
+                
+            // Clamp the end column in case it's a partial chunk at the edge
+            col_end = min(col_start + CHUNK_SIZE, total_cols_n)
+            
+            // --- PARALLEL MATH: Apply Householder to claimed columns ---
+            for j from col_start to col_end - 1:
+                
+                // 1. Calculate Dot Product: dot = v^T * A[:, j]
+                // (This inner loop is heavily vectorized via HVX intrinsics)
+                dot = 0.0
+                for i from current_k to total_rows_m - 1 step HVX_LANES:
+                    dot += v[i] * A[i, j] 
+                    
+                weight = tau * dot
+                
+                // 2. Update Column: A[:, j] = A[:, j] - weight * v
+                // (This inner loop is also heavily vectorized via HVX intrinsics)
+                for i from current_k to total_rows_m - 1 step HVX_LANES:
+                    A[i, j] = A[i, j] - (weight * v[i])
+                    
+        unlock_hardware(HVX)
+        
+        // --- REPORTING PHASE ---
+        remaining_workers = atomic_decrement_and_return(done_count)
+        
+        if (remaining_workers == 0):
+            set_signal(done_master)
