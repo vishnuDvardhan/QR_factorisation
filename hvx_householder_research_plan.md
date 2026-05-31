@@ -9,6 +9,37 @@ produce a publishable HiPC 2026 short paper.
 
 ---
 
+## Progress Log — 2026-05-31 (later) — Phase 2 step 1: scalar tiled QR (v8)
+
+Started Phase 2 (classic tiled QR, see `phase2_tiled_dag_plan.md`). New file
+`v8_tiled_dag_hvx.c`. **Step 1 = scalar correctness skeleton** (no HVX/threads yet):
+four tile kernels GEQRT / ORMQR / TSQRT / TSMQR built on two generic Householder
+primitives (`house_qr_panel`, `house_apply_panel`), driven by a sequential tiled loop.
+TSQRT/TSMQR use a dense 2B×B stacked scratch (correct; structure-exploiting form is a
+later optimization).
+
+**Correctness gate PASSED — 10/10 configs** vs `qr_cpu_householder` ground truth
+(`v8_verify.txt`, sweep `scripts_v8_verify.sh`). All sub-diagonal residuals **exactly
+0.0** (kernels write exact zeros); max |R|-err 9.2e-4 at the largest size (1024×128),
+within the 1e-3 gate:
+| m×n (B) | R-err | sub-diag |
+|---|---|---|
+| 128×128 (32/64) | 6.7e-5 | 0 |
+| 256×128 (32/64) | 1.2e-4 / 2.8e-4 | 0 |
+| 256×256 (64) | 2.8e-4 | 0 |
+| 512×64 (32) | 3.0e-4 | 0 |
+| 512×256 (64) | 2.6e-4 | 0 |
+| 384×96 (32) | 2.3e-4 | 0 |
+| 640×64 (32) | 7.4e-4 | 0 |
+| 1024×128 (64) | 9.2e-4 | 0 |
+
+Note: the scalar tiled skeleton is (expectedly) *slower* than the unblocked scalar ref
+in raw cycles — it does dense flops in the stacked TSQRT/TSMQR and isn't vectorized.
+That is fine: this step only locks correctness. Speed comes from steps 2–4 (HVX apply
+kernels → task graph → priority scheduling). **Next: step 2, HVX-ize ORMQR + TSMQR.**
+
+---
+
 ## Progress Log — 2026-05-31 — DAG-priority HVX scheduling (v7)
 
 **Goal of this phase:** bring the DAG task-scheduling ideas of Chatterjee et al.
