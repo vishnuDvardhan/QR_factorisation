@@ -36,7 +36,49 @@ within the 1e-3 gate:
 Note: the scalar tiled skeleton is (expectedly) *slower* than the unblocked scalar ref
 in raw cycles — it does dense flops in the stacked TSQRT/TSMQR and isn't vectorized.
 That is fine: this step only locks correctness. Speed comes from steps 2–4 (HVX apply
-kernels → task graph → priority scheduling). **Next: step 2, HVX-ize ORMQR + TSMQR.**
+kernels → task graph → priority scheduling).
+
+### Steps 2–4 done (v8 parallel scheduler — committed 4321906, 8b92bc3)
+- **Step 2 (HVX apply):** `house_apply_panel_hvx` vectorizes ORMQR/TSMQR over the
+  row dim (exploits `V[r<c]=0` to run the full tile-aligned range). ~1.6–1.9× over
+  the scalar skeleton; still correct (sub-diag exactly 0).
+- **Step 3+4 (DAG + priority HVX scheduler):** persistent worker pool over a task
+  DAG built by sequential-trace + per-tile last-writer (race-free by construction);
+  bottom-level critical-path priority; budgeted HVX-context allocator (first
+  min(nt,#units) workers hold a context → HVX apply, rest → scalar). Modes
+  async_prio / async / barrier / seq. **8/8 configs correct** (sub-diag 0):
+
+| mode | nt | 128×128 B32 cyc | vs seq |
+|---|---|---|---|
+| seq | 1 | 2,377,823 | 1.00× |
+| async_prio | 1 | 2,426,692 | 0.98× |
+| async_prio | 2 | 1,418,828 | 1.68× |
+| barrier | 4 | 1,420,562 | 1.67× |
+| async | 4 | 1,422,110 | 1.67× |
+| async_prio | 4 | 1,419,316 | 1.68× |
+
+**Honest read:** at 128×128 the tiled DAG is too thin (16 tiles, ~28 tasks) to feed
+4 workers, and the panel factor (GEQRT/TSQRT) is still *scalar* → the serial
+bottleneck. So nt=4 saturates at ~1.68× and the three modes tie — priority can't
+differentiate yet. The scheduling story should separate at larger sizes (independent
+tiles ≫ 4 contexts), which is step 5.
+
+### Hard-won lessons (worth a paper footnote)
+- The bring-up "deadlocks" were **host overload** (stray 100-min ISS processes
+  starving multi-second runs past the timeout), NOT scheduler bugs. Always kill
+  stray `hexagon-sim` and check load before trusting an ISS timeout.
+- Real bugs found+fixed: DAG predecessor-count corruption (macro var-shadow);
+  `qurt_sem_init` leaves count unspecified → use `qurt_sem_init_val(.,0)`;
+  semaphore teardown race after join.
+- `fflush(stdout)` after each printf is mandatory on this ISS to see progress
+  before a timeout-kill.
+
+### Next: step 5 — experiments at larger sizes
+- Sweep m,n ∈ {512,1024,2048}, B ∈ {32,64,128}, nt ∈ {1..8}; the regime where
+  priority HVX allocation should beat barrier/async.
+- Head-to-head vs Phase-1 v7 (unblocked) at matched sizes.
+- PMU counters + roofline (GFLOP/s vs HVX peak).
+- HVX-ize GEQRT/TSQRT panel factor if it remains the bottleneck.
 
 ---
 
