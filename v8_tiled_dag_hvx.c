@@ -40,13 +40,15 @@
 #include "hexagon_types.h"
 #include "hvx_hexagon_protos.h"
 
+#include "hvx_utils.h"   /* hvx_dot_col_v, hvx_reduce_qf32, HVX_VectorU_t */
+
 QURT_DECLARE_STATIC_HEAP(16777216 * 2);
 unsigned int heapSize = 16777216;
 
 #define HVX_FLOAT_LANES 32
 #define DEFAULT_NB      32
 
-static const char* VARIANT_NAME = "tiled_dag_hvx [seq-scalar]";
+static const char* VARIANT_NAME = "tiled_dag_hvx [seq-hvxapply]";
 
 typedef struct { float* data; int m; int n; } Matrix;
 #define MAT(mat, i, j) ((mat).data[(j) * (mat).m + (i)])
@@ -165,7 +167,9 @@ static void house_qr_panel(float* P, int ldp, int rows, int cols,
 }
 
 /* Apply Q^T (= H_{cols_v-1} ... H_0) of the reflectors in V to C (ld=ldc),
- * rows x cols_c.  Applies H_0 first => computes Q^T C. */
+ * rows x cols_c.  Applies H_0 first => computes Q^T C.  Scalar reference
+ * (kept for correctness comparison / fallback; HVX path is the default). */
+__attribute__((unused))
 static void house_apply_panel(const float* V, int ldv, const float* tau,
                               int rows, int cols_v,
                               float* C, int ldc, int cols_c) {
@@ -179,6 +183,41 @@ static void house_apply_panel(const float* V, int ldv, const float* tau,
             float w = tau_c * dot;
             for (int r = c; r < rows; r++)
                 C[r + (size_t)jj*ldc] -= w * V[r + (size_t)c*ldv];
+        }
+    }
+}
+
+/* HVX apply: same math, vectorized over the row dimension.
+ *
+ * Key enabler: house_qr_panel zeroes V[r<c], so summing/updating over the
+ * FULL row range [0,rows) gives identical results to the masked [c,rows)
+ * range (the extra lanes multiply by V==0).  rows is a tile height (B or 2B,
+ * both multiples of HVX_FLOAT_LANES), so each reflector/column is an exact
+ * number of HVX vectors.  Requires V columns (ldv) and C columns (ldc) to be
+ * HVX-addressable — true here: V scratch ld is rows (B or 2B); C is either a
+ * matrix tile (ld=m, m mult of 32) or stacked scratch (ld=2B).  The first row
+ * of each column must be 128B-ish aligned for fast loads; we use the unaligned
+ * HVX_VectorU_t load (4B align) to stay correct regardless. */
+static void house_apply_panel_hvx(const float* V, int ldv, const float* tau,
+                                   int rows, int cols_v,
+                                   float* C, int ldc, int cols_c) {
+    for (int c = 0; c < cols_v; c++) {
+        float tau_c = tau[c];
+        if (tau_c == 0.f) continue;
+        const float* vc = V + (size_t)c*ldv;          /* reflector column */
+        for (int jj = 0; jj < cols_c; jj++) {
+            float* cj = C + (size_t)jj*ldc;
+            float dot = hvx_dot_col_v(cj, vc, rows);   /* qf32 dot + tree reduce */
+            float w = tau_c * dot;
+            HVX_Vector vw = Q6_V_vsplat_R(*(uint32_t*)&w);
+            for (int r = 0; r < rows; r += HVX_FLOAT_LANES) {
+                HVX_Vector ca = *(HVX_VectorU_t*)(cj + r);
+                HVX_Vector vv = *(const HVX_VectorU_t*)(vc + r);
+                HVX_Vector ca_qf = Q6_Vqf32_vadd_VsfVsf(ca, Q6_V_vzero());
+                HVX_Vector vp    = Q6_Vqf32_vmpy_VsfVsf(vw, vv);
+                *(HVX_VectorU_t*)(cj + r) =
+                    Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_Vqf32Vqf32(ca_qf, vp));
+            }
         }
     }
 }
@@ -204,7 +243,7 @@ static void k_geqrt(Matrix* A, TileScratch* w, int k) {
 static void k_ormqr(Matrix* A, TileScratch* w, int k, int j) {
     int B = w->B, m = A->m;
     float* C = &MAT(*A, k*B, j*B);
-    house_apply_panel(w->Vkk, B, w->tau_kk, B, B, C, m, B);
+    house_apply_panel_hvx(w->Vkk, B, w->tau_kk, B, B, C, m, B);
 }
 
 static void k_tsqrt(Matrix* A, TileScratch* w, int i, int k) {
@@ -230,7 +269,7 @@ static void k_tsmqr(Matrix* A, TileScratch* w, int i, int k, int j) {
             w->S2[r     + (size_t)c*P2] = MAT(*A, k*B + r, j*B + c);
             w->S2[B + r + (size_t)c*P2] = MAT(*A, i*B + r, j*B + c);
         }
-    house_apply_panel(w->V2, P2, w->tau2, P2, B, w->S2, P2, B);
+    house_apply_panel_hvx(w->V2, P2, w->tau2, P2, B, w->S2, P2, B);
     for (int c = 0; c < B; c++)
         for (int r = 0; r < B; r++) {
             MAT(*A, k*B + r, j*B + c) = w->S2[r     + (size_t)c*P2];
@@ -254,6 +293,11 @@ static void tiled_qr_seq(Matrix* A, int B) {
     w.S      = (float*)memalign(128, (size_t)2 * B * B * sizeof(float));
     w.S2     = (float*)memalign(128, (size_t)2 * B * B * sizeof(float));
 
+    /* The ORMQR/TSMQR apply kernels use HVX; acquire a context for the run.
+     * (Sequential driver — the multi-context scheduling lands in step 4.) */
+    int hvx_held = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
+    if (!hvx_held) printf("WARNING: qurt_hvx_lock failed; apply kernels need HVX\n");
+
     for (int k = 0; k < NT; k++) {
         k_geqrt(A, &w, k);
         for (int j = k + 1; j < NT; j++) k_ormqr(A, &w, k, j);
@@ -262,6 +306,8 @@ static void tiled_qr_seq(Matrix* A, int B) {
             for (int j = k + 1; j < NT; j++) k_tsmqr(A, &w, i, k, j);
         }
     }
+
+    if (hvx_held) qurt_hvx_unlock();
 
     /* Materialize R: zero everything strictly below the diagonal (the lower
      * tiles held reflector / consumed data — Q is not reconstructed here). */
