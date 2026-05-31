@@ -154,7 +154,7 @@ static void qr_cpu_householder(Matrix* A) {
  * as the (unnormalized) Householder vector v with v[c]=x_c-alpha, v[r>c]=x_r,
  * v[r<c]=0; tau[c]=2/||v||^2 (same convention as qr_cpu_householder). */
 static void house_qr_panel(float* P, int ldp, int rows, int cols,
-                           float* V, int ldv, float* tau) {
+                           float* V, int ldv, float* tau, int use_hvx) {
     for (int c = 0; c < cols; c++) {
         float nxsq = 0.f;
         for (int r = c; r < rows; r++) { float x = P[r + (size_t)c*ldp]; nxsq += x*x; }
@@ -169,13 +169,31 @@ static void house_qr_panel(float* P, int ldp, int rows, int cols,
         for (int r = c; r < rows; r++) { float vv = V[r + (size_t)c*ldv]; nvsq += vv*vv; }
         if (nvsq < 1e-10f) { tau[c] = 0.f; continue; }
         float tau_c = 2.f / nvsq; tau[c] = tau_c;
+        float* vcol = V + (size_t)c*ldv;
+        /* Trailing update is a reflector apply.  v[r<c]=0, so dot/saxpy over the
+         * full tile-aligned range [0,rows) match the masked [c,rows) range and
+         * vectorize cleanly (rows is a multiple of HVX_FLOAT_LANES).  Only HVX-
+         * context holders take the vector path; others stay scalar. */
         for (int jj = c; jj < cols; jj++) {
-            float dot = 0.f;
-            for (int r = c; r < rows; r++)
-                dot += V[r + (size_t)c*ldv] * P[r + (size_t)jj*ldp];
-            float w = tau_c * dot;
-            for (int r = c; r < rows; r++)
-                P[r + (size_t)jj*ldp] -= w * V[r + (size_t)c*ldv];
+            float* pj = P + (size_t)jj*ldp;
+            if (use_hvx) {
+                float dot = hvx_dot_col_v(pj, vcol, rows);
+                float w = tau_c * dot;
+                HVX_Vector vw = Q6_V_vsplat_R(*(uint32_t*)&w);
+                for (int r = 0; r < rows; r += HVX_FLOAT_LANES) {
+                    HVX_Vector pa = *(HVX_VectorU_t*)(pj + r);
+                    HVX_Vector vv = *(const HVX_VectorU_t*)(vcol + r);
+                    HVX_Vector pa_qf = Q6_Vqf32_vadd_VsfVsf(pa, Q6_V_vzero());
+                    HVX_Vector vp    = Q6_Vqf32_vmpy_VsfVsf(vw, vv);
+                    *(HVX_VectorU_t*)(pj + r) =
+                        Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_Vqf32Vqf32(pa_qf, vp));
+                }
+            } else {
+                float dot = 0.f;
+                for (int r = c; r < rows; r++) dot += vcol[r] * pj[r];
+                float w = tau_c * dot;
+                for (int r = c; r < rows; r++) pj[r] -= w * vcol[r];
+            }
         }
         for (int r = c + 1; r < rows; r++) P[r + (size_t)c*ldp] = 0.f; /* exact zeros */
     }
@@ -252,7 +270,7 @@ typedef struct {
 static void k_geqrt(Matrix* A, TileScratch* w, int k) {
     int B = w->B, m = A->m;
     float* P = &MAT(*A, k*B, k*B);
-    house_qr_panel(P, m, B, B, w->Vkk, B, w->tau_kk);
+    house_qr_panel(P, m, B, B, w->Vkk, B, w->tau_kk, 1);
 }
 
 static void k_ormqr(Matrix* A, TileScratch* w, int k, int j) {
@@ -269,7 +287,7 @@ static void k_tsqrt(Matrix* A, TileScratch* w, int i, int k) {
             w->S[r       + (size_t)c*P2] = MAT(*A, k*B + r, k*B + c);
             w->S[B + r   + (size_t)c*P2] = MAT(*A, i*B + r, k*B + c);
         }
-    house_qr_panel(w->S, P2, P2, B, w->V2, P2, w->tau2);
+    house_qr_panel(w->S, P2, P2, B, w->V2, P2, w->tau2, 1);
     /* new R diagonal tile := top of S */
     for (int c = 0; c < B; c++)
         for (int r = 0; r < B; r++)
@@ -387,12 +405,12 @@ static inline float* TAUKK(int k)    { return g.tau_kk + (size_t)k * g.B; }
 static inline float* V2S(int i,int k){ return g.V2  + (size_t)(k*g.MT+i) * (2*g.B*g.B); }
 static inline float* TAU2(int i,int k){return g.tau2 + (size_t)(k*g.MT+i) * g.B; }
 
-/* one task body; use_hvx selects the apply path (GEQRT/TSQRT are scalar). */
+/* one task body; use_hvx selects the vector path for every kernel. */
 static void exec_task(const Task* t, int tid, int use_hvx) {
     Matrix* A = g.A; int B = g.B, m = g.m, P2 = 2*g.B;
     switch (t->kind) {
     case K_GEQRT:
-        house_qr_panel(&MAT(*A, t->k*B, t->k*B), m, B, B, VKK(t->k), B, TAUKK(t->k));
+        house_qr_panel(&MAT(*A, t->k*B, t->k*B), m, B, B, VKK(t->k), B, TAUKK(t->k), use_hvx);
         break;
     case K_ORMQR: {
         float* C = &MAT(*A, t->k*B, t->j*B);
@@ -406,7 +424,7 @@ static void exec_task(const Task* t, int tid, int use_hvx) {
                 S[r     + (size_t)c*P2] = MAT(*A, t->k*B + r, t->k*B + c);
                 S[B + r + (size_t)c*P2] = MAT(*A, t->i*B + r, t->k*B + c);
             }
-        house_qr_panel(S, P2, P2, B, V2S(t->i,t->k), P2, TAU2(t->i,t->k));
+        house_qr_panel(S, P2, P2, B, V2S(t->i,t->k), P2, TAU2(t->i,t->k), use_hvx);
         for (int c = 0; c < B; c++)
             for (int r = 0; r < B; r++)
                 MAT(*A, t->k*B + r, t->k*B + c) = S[r + (size_t)c*P2];
