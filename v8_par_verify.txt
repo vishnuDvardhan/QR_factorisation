@@ -1,0 +1,10 @@
+# v8 parallel tiled-QR correctness (mode nt m n B | result)
+seq        128 B32         | [alg] tiled_dag_hvx [seq] ... 2377823 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+barrier nt4 128 B32        | [alg] tiled_dag_hvx [barrier] ... 1420562 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+async   nt4 128 B32        | [alg] tiled_dag_hvx [async] ... 1422110 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt4 128 B32     | [alg] tiled_dag_hvx [async_prio] ... 1419316 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt1 128 B32     | [alg] tiled_dag_hvx [async_prio] ... 2426692 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt2 128 B32     | [alg] tiled_dag_hvx [async_prio] ... 1418828 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt4 256 B32     | [alg] tiled_dag_hvx [async_prio] ... 3770269 cycles  |  max |R|-err: 1.411e-04 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt4 256 B64     | [alg] tiled_dag_hvx [async_prio] ... 7474275 cycles  |  max |R|-err: 2.785e-04 OK  |  sub-diag: 0.000e+00 OK
+ALL DONE

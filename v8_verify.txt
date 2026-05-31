@@ -1,12 +1,12 @@
 # v8 scalar tiled QR correctness sweep (m n B | result)
-m=128  n=128  B=32  | [alg] tiled_dag_hvx [seq-scalar] ... 4218904 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
-m=128  n=128  B=64  | [alg] tiled_dag_hvx [seq-scalar] ... 4428262 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
-m=256  n=128  B=32  | [alg] tiled_dag_hvx [seq-scalar] ... 10638858 cycles  |  max |R|-err: 1.215e-04 OK  |  sub-diag: 0.000e+00 OK
-m=256  n=128  B=64  | [alg] tiled_dag_hvx [seq-scalar] ... 11564041 cycles  |  max |R|-err: 2.785e-04 OK  |  sub-diag: 0.000e+00 OK
-m=256  n=256  B=64  | [alg] tiled_dag_hvx [seq-scalar] ... 23823936 cycles  |  max |R|-err: 2.785e-04 OK  |  sub-diag: 0.000e+00 OK
-m=512  n=64   B=32  | [alg] tiled_dag_hvx [seq-scalar] ... 11068761 cycles  |  max |R|-err: 3.014e-04 OK  |  sub-diag: 0.000e+00 OK
-m=512  n=256  B=64  | [alg] tiled_dag_hvx [seq-scalar] ... 57825161 cycles  |  max |R|-err: 2.632e-04 OK  |  sub-diag: 0.000e+00 OK
-m=384  n=96   B=32  | [alg] tiled_dag_hvx [seq-scalar] ... 12687462 cycles  |  max |R|-err: 2.327e-04 OK  |  sub-diag: 0.000e+00 OK
-m=640  n=64   B=32  | [alg] tiled_dag_hvx [seq-scalar] ... 14309402 cycles  |  max |R|-err: 7.439e-04 OK  |  sub-diag: 0.000e+00 OK
-m=1024 n=128  B=64  | [alg] tiled_dag_hvx [seq-scalar] ... 59221777 cycles  |  max |R|-err: 9.232e-04 OK  |  sub-diag: 0.000e+00 OK
+m=128  n=128  B=32  | [alg] tiled_dag_hvx [seq-hvxapply] ... 2377727 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+m=128  n=128  B=64  | [alg] tiled_dag_hvx [seq-hvxapply] ... 2772385 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 0.000e+00 OK
+m=256  n=128  B=32  | [alg] tiled_dag_hvx [seq-hvxapply] ... 6472406 cycles  |  max |R|-err: 1.411e-04 OK  |  sub-diag: 0.000e+00 OK
+m=256  n=128  B=64  | [alg] tiled_dag_hvx [seq-hvxapply] ... 8567699 cycles  |  max |R|-err: 2.785e-04 OK  |  sub-diag: 0.000e+00 OK
+m=256  n=256  B=64  | [alg] tiled_dag_hvx [seq-hvxapply] ... 11607304 cycles  |  max |R|-err: 2.785e-04 OK  |  sub-diag: 0.000e+00 OK
+m=512  n=64   B=32  | [alg] tiled_dag_hvx [seq-hvxapply] ... 9267479 cycles  |  max |R|-err: 3.014e-04 OK  |  sub-diag: 0.000e+00 OK
+m=512  n=256  B=64  | [alg] tiled_dag_hvx [seq-hvxapply] ... 30788856 cycles  |  max |R|-err: 2.632e-04 OK  |  sub-diag: 0.000e+00 OK
+m=384  n=96   B=32  | [alg] tiled_dag_hvx [seq-hvxapply] ... 8735506 cycles  |  max |R|-err: 2.327e-04 OK  |  sub-diag: 0.000e+00 OK
+m=640  n=64   B=32  | [alg] tiled_dag_hvx [seq-hvxapply] ... 11984816 cycles  |  max |R|-err: 7.439e-04 OK  |  sub-diag: 0.000e+00 OK
+m=1024 n=128  B=64  | [alg] tiled_dag_hvx [seq-hvxapply] ... 48485082 cycles  |  max |R|-err: 9.232e-04 OK  |  sub-diag: 0.000e+00 OK
 ALL DONE
