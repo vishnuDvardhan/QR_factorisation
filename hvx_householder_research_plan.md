@@ -9,6 +9,93 @@ produce a publishable HiPC 2026 short paper.
 
 ---
 
+## Progress Log — 2026-05-31 — DAG-priority HVX scheduling (v7)
+
+**Goal of this phase:** bring the DAG task-scheduling ideas of Chatterjee et al.
+(`souyajit-paper.pdf`, arXiv 2506.09463) to our HVX Householder QR, and schedule the
+scarce HVX *vector contexts* (4 in 128B mode) to tasks by DAG priority. New file:
+`v7_dag_hvx_sched.c`. Full plan: `~/.claude/plans/delegated-fluttering-chipmunk.md`.
+
+### What the paper does / doesn't give us
+It is a **multicore CPU** paper (Intel TBB, 26–104 threads) — **no HVX / DSP / vector
+unit notion**. Reusable parts: (1) the task DAG `T(k,k)`=reflector, `T(k,j>k)`=trailing
+update, edges `T(k,j)←T(k,k)` and `T(k,j)←T(k-1,j)`; (2) the scheduling ladder
+barrier → async dual-queue → priority. Our novel bit is making the *HVX context* the
+scheduled resource. **Critical path = update of column k+1 each step** (reflector k+1
+waits only on it), so critical-path priority = "do column k+1 first, compute reflector
+k+1 while workers finish k+2…n-1." Priority is closed-form (ascending column index) —
+no runtime graph analysis.
+
+### Bugs found & fixed (both important, worth writing up)
+1. **`qurt_hvx_try_lock` is deprecated on v65+ and does NOT grant a context** → every
+   worker silently fell to the scalar path → **~5× slowdown** (3.2M cyc) in *both*
+   scheduler modes. Fixed with an **atomic HVX-budget allocator**: a worker claims a
+   slot with one `qurt_atomic_inc_return`; only if `slot ≤ worker_units` does it call
+   the (blocking) `qurt_hvx_lock` — so the lock is only ever taken when a context is
+   provably free. Clean scalar fallback for workers beyond the budget. *This is the
+   "allocate the 4 HVX units by priority" mechanism.*
+2. **Main thread holding a context for its lifetime** starved a worker exactly at
+   `nt == #contexts` (nt=4: 933,644 cyc, *worse* than v0). Fixed: main locks a context
+   only *briefly* for the single critical column k+1 (between the previous join and the
+   next dispatch, when no worker is active), then releases it so workers get all 4.
+
+### Results (m=640, n=64, chunk=4; cycles via c15:14; all correct)
+All variants verified: max|R|-err ≈ 2.2e-4, sub-diagonal residual ≈ 3.5e-7.
+
+**E1 head-to-head @ nt=4:**
+| Variant | Cycles | vs v0_pool | vs scalar(11.77M) |
+|---|---|---|---|
+| colmajor_mt (spawn-per-step) | 1,635,916 | 2.59× slower | 7.2× |
+| v0_pool (barrier) | 630,569 | 1.00× | 18.7× |
+| v7 barrier (=v0 algo + HVX tree-reduce) | 567,798 | 0.90× | 20.7× |
+| **v7 async_prio (final)** | **473,042** | **0.75× (1.33× speedup)** | **24.9×** |
+
+**E3 nt sweep — async_prio vs v0_pool (lower = better):**
+| nt | v0_pool | v7 async_prio (1st: main holds ctx) | v7 async_prio (FINAL: brief lock) |
+|---|---|---|---|
+| 1 | 1,244,001 | 859,956 | 884,149 |
+| 2 | 817,203 | 564,410 | 588,172 |
+| 3 | — | 486,553 | 500,897 |
+| 4 | 630,087 | 933,644 ← collapse | **473,042** ← best |
+| 6 | 685,033 | 598,943 | 497,721 |
+| 8 | 719,837 | 594,832 | 522,616 |
+
+### Conclusions
+- **HVX tree-reduction (P1) is a free ~10%** — `v7 barrier` vs `v0` is the same
+  algorithm except the dot-product reduction is in-register (no store-to-temp[32]).
+- **The scarce resource on Hexagon is the HVX context (≈4), not the thread.** v0_pool
+  *degrades* past nt=4 (630K→720K @ nt=8) as surplus threads thrash the lock; v7
+  async_prio stays flat (473K–523K) because over-budget workers do useful scalar work
+  instead of blocking. This is the headline DSP-specific result.
+- **Critical-path pivot overlap + correct context budgeting wins at every nt.** Final
+  v7 best = **473,042 @ nt=4 = 1.33× over v0_pool, 3.46× over colmajor_mt, 24.9× over
+  scalar.** Inverts the paper's CPU finding that priority barely helped — because
+  contexts are far scarcer than the paper's 26–104 threads, allocation matters more.
+- **Busy-waiting is catastrophic here** (first cut spun main on `col_done[k+1]` → 5×):
+  on an in-order SMT DSP a spinning thread steals an HW slot + memory BW from HVX
+  workers. The fix is to give the main thread *real work* (the critical column).
+
+### Reproduce
+`scripts_bench.sh` (E1+E3, all variants) and `scripts_resweep.sh` (v7 nt sweep) →
+`results_bench.txt`, `resweep.txt`. Per-run config in `build/inparams.txt`
+(`m n nt chunk sched nb`; sched 0=async_prio, 1=barrier).
+
+### E4 size sweep — DONE (nt=4, chunk=4; 24/24 configs correct; see `e4_results.txt`)
+v7_async_prio speedup over v0_pool (cycles); the margin **grows with size**:
+| | m=128 | m=256 | m=512 | m=1024 |
+|---|---|---|---|---|
+| n=32 | 1.06× | 1.34× | 1.39× | 1.30× |
+| n=64 | 1.12× | 1.22× | 1.31× | 1.39× |
+Largest matrix m=1024 n=64: v0 920,205 → v7_async_prio **661,979 (1.39×)**; barrier
+839,239. Confirms the 640×64 result is not a fluke and the advantage scales.
+
+### Next
+- Phase 2: tiled DAG (`v8_tiled_dag_hvx.c`) — GEQRT/TSQRT/LARFB 2-D tile DAG, same
+  priority HVX allocator. *Strengthens paper but not strictly required.*
+- (Optional, cheap) parse `pmu_stats.txt` alongside cycles for a mechanism story.
+
+---
+
 ## Progress Log — 2026-05-30
 
 ### Done today

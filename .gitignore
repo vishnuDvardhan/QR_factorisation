@@ -1,10 +1,19 @@
-# Build artifacts (compiled binaries, object files, generated cfgs)
-build/hexagon/
+# Build artifacts
+build/
+*.o
 
-# Local Claude Code harness state
-.claude/
+# Symlinks into the host filesystem / SDK (not repo content)
+Qualcomm
+local
+temp
 
-# Python
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
+# Hexagon binaries (no extension, live in build/ anyway) and dumps
+*.pbn
+pmu_stats.txt
+
+# Third-party reference paper (copyrighted; keep local only)
+souyajit-paper.pdf
+
+# Editor/backup junk
+*.orig
+* copy.c

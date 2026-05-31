@@ -371,11 +371,12 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
     vbuf[1] = (float*)memalign(128, (size_t)m * sizeof(float));
     int cur = 0;
 
-    /* Reserve one HVX context for the critical path (main thread); workers
-     * share the rest. */
-    int main_hvx = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
-    g_pool.hvx_worker_units = g_hvx_units_128b - (main_hvx ? 1 : 0);
-    if (g_pool.hvx_worker_units < 0) g_pool.hvx_worker_units = 0;
+    /* Workers get ALL HVX contexts.  The main thread does NOT hold a context
+     * for its lifetime (that starved a worker at nt == #contexts).  Instead it
+     * locks a context *briefly* for the single critical column k+1 — between
+     * the previous step's join and this step's dispatch, when no worker is
+     * active — then releases it before the bulk dispatch + wait. */
+    g_pool.hvx_worker_units = g_hvx_units_128b;
 
     valid[cur] = compute_reflector(A, m, 0, vbuf[cur], &alpha[cur], &tau[cur]);
 
@@ -383,18 +384,24 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
         int nxt = cur ^ 1;
         int dispatched = 0;
 
-        /* Workers take the lower-priority columns [k+2, n); main keeps k+1. */
+        /* Critical-path task T(k,k+1): update column k+1 first, on HVX, while
+         * no workers hold a context (prev step already joined). */
+        if (valid[cur] && k + 1 < n) {
+            if (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK) {
+                apply_col_hvx(A, vbuf[cur], tau[cur], k + 1, m);
+                qurt_hvx_unlock();
+            } else {
+                apply_col_scalar(A, vbuf[cur], tau[cur], k + 1, m);
+            }
+        }
+
+        /* Workers take the lower-priority columns [k+2, n) with all contexts. */
         if (valid[cur])
             dispatched = pool_dispatch_nonblocking(A, vbuf[cur], tau[cur],
                                                    k + 2, n, chunk_size);
 
-        if (valid[cur] && k + 1 < n) {
-            /* Critical-path task T(k,k+1): do it now, in parallel with workers. */
-            if (main_hvx) apply_col_hvx(A, vbuf[cur], tau[cur], k + 1, m);
-            else          apply_col_scalar(A, vbuf[cur], tau[cur], k + 1, m);
-        }
-
-        if (k + 1 < n)                       /* reflector k+1 overlaps workers */
+        /* Reflector k+1 is pure scalar — overlaps the workers' HVX updates. */
+        if (k + 1 < n)
             valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
                                            &alpha[nxt], &tau[nxt]);
 
@@ -407,7 +414,6 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
         cur = nxt;
     }
 
-    if (main_hvx) qurt_hvx_unlock();
     free(vbuf[0]); free(vbuf[1]);
 }
 

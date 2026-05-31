@@ -1,0 +1,30 @@
+# E4 size sweep @ nt=4 chunk=4  (cycles via c15:14; all variants correct)
+# columns: variant  m  n  cycles  |  max|R|-err  sub-diag
+v0_pool        m=128  n=32  | 158224  | 1.717e-05
+v7_barrier     m=128  n=32  | 151580  | 3.242e-05  1.054e-06
+v7_async_prio  m=128  n=32  | 149971  | 3.242e-05  1.054e-06
+v0_pool        m=256  n=32  | 233635  | 4.959e-05
+v7_barrier     m=256  n=32  | 216706  | 4.959e-05  8.135e-07
+v7_async_prio  m=256  n=32  | 174482  | 4.959e-05  8.135e-07
+v0_pool        m=512  n=32  | 351170  | 1.290e-04
+v7_barrier     m=512  n=32  | 309453  | 1.221e-04  1.546e-08
+v7_async_prio  m=512  n=32  | 252645  | 1.221e-04  1.546e-08
+v0_pool        m=1024 n=32  | 561170  | 2.975e-04
+v7_barrier     m=1024 n=32  | 514293  | 3.204e-04  4.758e-07
+v7_async_prio  m=1024 n=32  | 430811  | 3.204e-04  4.758e-07
+v0_pool        m=128  n=64  | 225125  | 1.717e-05
+v7_barrier     m=128  n=64  | 202985  | 3.242e-05  1.054e-06
+v7_async_prio  m=128  n=64  | 201726  | 3.242e-05  1.054e-06
+v0_pool        m=256  n=64  | 349340  | 4.959e-05
+v7_barrier     m=256  n=64  | 303591  | 4.959e-05  8.135e-07
+v7_async_prio  m=256  n=64  | 285881  | 4.959e-05  8.135e-07
+v0_pool        m=512  n=64  | 529120  | 1.290e-04
+v7_barrier     m=512  n=64  | 464151  | 1.221e-04  1.546e-08
+v7_async_prio  m=512  n=64  | 402659  | 1.221e-04  1.546e-08
+v0_pool        m=1024 n=64  | 920205  | 2.975e-04
+v7_barrier     m=1024 n=64  | 839239  | 3.204e-04  4.758e-07
+v7_async_prio  m=1024 n=64  | 661979  | 3.204e-04  4.758e-07
+# ALL DONE (24/24 configs, all correct)
+# speedup v7_async_prio over v0_pool:
+#   n=32: 1.06x(128) 1.34x(256) 1.39x(512) 1.30x(1024)
+#   n=64: 1.12x(128) 1.22x(256) 1.31x(512) 1.39x(1024)

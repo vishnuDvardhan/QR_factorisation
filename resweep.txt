@@ -1,0 +1,8 @@
+# v7_async_prio (context-handoff fix) @ m=640 n=64 chunk=4
+async_prio nt=1 | [alg] dag_hvx_sched [async_prio] ... 884149 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+async_prio nt=2 | [alg] dag_hvx_sched [async_prio] ... 588172 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+async_prio nt=3 | [alg] dag_hvx_sched [async_prio] ... 500897 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+async_prio nt=4 | [alg] dag_hvx_sched [async_prio] ... 473042 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+async_prio nt=6 | [alg] dag_hvx_sched [async_prio] ... 497721 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+async_prio nt=8 | [alg] dag_hvx_sched [async_prio] ... 522616 cycles  |  max |R|-err: 2.213e-04 OK  |  sub-diag: 3.538e-07 OK
+ALL DONE
