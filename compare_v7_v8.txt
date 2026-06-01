@@ -1,0 +1,32 @@
+# ============================================================
+# v7 vs v8 comprehensive comparison   (B=32, nt={4})
+# cycles via c15:14 ISS timing; lower is better
+# generated: 2026-05-31 23:55:40
+# ============================================================
+building variants...
+
+### size 128x128  (B=32 for v8; v7/v0/colmajor ignore B) ###
+colmajor_mt            spawn        m=128   n=128   nt=4  B=32   |      1168982 cyc | err=NA         | OK
+v0_pool                barrier      m=128   n=128   nt=4  B=32   |       341377 cyc | err=1.717e-05  | OK
+v1_hvx_red             P1           m=128   n=128   nt=4  B=32   |       301989 cyc | err=3.242e-05  | OK
+v3_persist             P4           m=128   n=128   nt=4  B=32   |       338018 cyc | err=1.717e-05  | OK
+v7_unblk_dag           async_prio   m=128   n=128   nt=4  B=32   |       289327 cyc | err=3.242e-05  | OK
+v7_unblk_dag           barrier      m=128   n=128   nt=4  B=32   |       287766 cyc | err=3.242e-05  | OK
+v8_tiled_dag           seq          m=128   n=128   nt=4  B=32   |      1406270 cyc | err=6.485e-05  | OK
+v8_tiled_dag           barrier      m=128   n=128   nt=4  B=32   |       622405 cyc | err=6.485e-05  | OK
+v8_tiled_dag           async        m=128   n=128   nt=4  B=32   |       620131 cyc | err=6.485e-05  | OK
+v8_tiled_dag           async_prio   m=128   n=128   nt=4  B=32   |       622404 cyc | err=6.485e-05  | OK
+
+### size 256x256  (B=32 for v8; v7/v0/colmajor ignore B) ###
+colmajor_mt            spawn        m=256   n=256   nt=4  B=32   |      2260307 cyc | err=NA         | OK
+v0_pool                barrier      m=256   n=256   nt=4  B=32   |       938095 cyc | err=4.959e-05  | OK
+v1_hvx_red             P1           m=256   n=256   nt=4  B=32   |       792991 cyc | err=4.959e-05  | OK
+v3_persist             P4           m=256   n=256   nt=4  B=32   |       931954 cyc | err=4.959e-05  | OK
+v7_unblk_dag           async_prio   m=256   n=256   nt=4  B=32   |       724195 cyc | err=4.959e-05  | OK
+v7_unblk_dag           barrier      m=256   n=256   nt=4  B=32   |       735121 cyc | err=4.959e-05  | OK
+v8_tiled_dag           seq          m=256   n=256   nt=4  B=32   |      6996080 cyc | err=1.526e-04  | OK
+v8_tiled_dag           barrier      m=256   n=256   nt=4  B=32   |      2225774 cyc | err=1.526e-04  | OK
+v8_tiled_dag           async        m=256   n=256   nt=4  B=32   |      2623194 cyc | err=1.526e-04  | OK
+v8_tiled_dag           async_prio   m=256   n=256   nt=4  B=32   |      2235011 cyc | err=1.526e-04  | OK
+
+ALL DONE

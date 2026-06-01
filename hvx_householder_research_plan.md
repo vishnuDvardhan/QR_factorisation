@@ -73,12 +73,50 @@ tiles ≫ 4 contexts), which is step 5.
 - `fflush(stdout)` after each printf is mandatory on this ISS to see progress
   before a timeout-kill.
 
-### Next: step 5 — experiments at larger sizes
-- Sweep m,n ∈ {512,1024,2048}, B ∈ {32,64,128}, nt ∈ {1..8}; the regime where
-  priority HVX allocation should beat barrier/async.
-- Head-to-head vs Phase-1 v7 (unblocked) at matched sizes.
-- PMU counters + roofline (GFLOP/s vs HVX peak).
-- HVX-ize GEQRT/TSQRT panel factor if it remains the bottleneck.
+### Step 5 — v7 vs v8 head-to-head (DONE; `compare_v7_v8.{txt,csv}`, `scripts_compare_v7_v8.sh`)
+nt=4, B=32, cycles (c15:14), all correct:
+
+| variant / mode | 128×128 | 256×256 |
+|---|---|---|
+| colmajor_mt (spawn) | 1,168,982 | 2,260,307 |
+| v0_pool (barrier) | 341,377 | 938,095 |
+| v1_hvx_red (P1) | 301,989 | 792,991 |
+| v3_persist (P4) | 338,018 | 931,954 |
+| **v7 unblk async_prio** | 289,327 | **724,195** |
+| **v7 unblk barrier** | **287,766** | 735,121 |
+| v8 tiled seq | 1,406,270 | 6,996,080 |
+| v8 tiled barrier | 622,405 | 2,225,774 |
+| v8 tiled async | 620,131 | 2,623,194 |
+| v8 tiled async_prio | 622,404 | 2,235,011 |
+
+**Headline finding (robust, defensible, NOT a bug):** the **unblocked v7 beats the
+tiled v8**, and the gap *widens* with size — 2.2× at 128, **3.1× at 256**. This
+inverts the classic CPU/HPC "tiling wins at scale" intuition, for two
+platform-specific reasons:
+1. **Structure-unaware coupled kernels.** Our TSQRT/TSMQR factor/apply the stacked
+   2B×B pair densely, so the tiled algorithm does ~9× more arithmetic than unblocked
+   (v8 seq = 6.996M vs v7 ≈ 0.73M at 256). HVX+scheduling claw most of it back (to
+   ~2.23M) but cannot beat v7's lean unblocked kernel.
+2. **Only 4 HVX contexts.** Tiling's extra task-level concurrency can't be cashed in
+   beyond 4 vector units, so the tiling overhead isn't repaid by parallel speedup.
+
+**v8 scheduler modes tie** (barrier 2.226M ≈ async_prio 2.235M ≈ async 2.623M at 256;
+same at 128, 256-B64, 512-B32) — with 4 contexts, scheduling *policy* does not move
+the tiled DAG. Priority differentiation needs either ≫4 vector units or
+structure-exploiting kernels that lower the arithmetic floor.
+
+**Paper implication:** lead with the **v7 result** (HVX-context-aware DAG scheduling
+for unblocked QR; vector context is the scarce resource; 1.3–1.4× over pool, graceful
+past 4 threads). Frame the **tiled v8 as a boundary/negative result**: naive tiling
+does not pay off on a 4-context DSP because structure-unaware coupled kernels inflate
+arithmetic faster than the limited vector parallelism can absorb. A structure-exploiting
+TSQRT/TSMQR (triangular V, internal-blocking) is the path to make tiling competitive —
+future work, and the strongest lever if real hardware exposes more contexts.
+
+### Remaining (optional polish)
+- PMU counters + roofline (GFLOP/s vs HVX peak) for both v7 and v8.
+- Structure-exploiting TSQRT/TSMQR (would change the v8 verdict).
+- Real-hardware validation point when the board arrives.
 
 ---
 

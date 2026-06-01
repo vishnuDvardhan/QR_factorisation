@@ -1,0 +1,4 @@
+# v8 large-size B=32 sweep. label | cycles | err
+512 B32 async_prio nt4         | [alg] tiled_dag_hvx [async_prio] ... 14411877 cycles  |  max |R|-err: 2.932e-04 OK  |  sub-diag: 0.000e+00 OK
+512 B32 barrier    nt4         | [alg] tiled_dag_hvx [barrier] ... 14378170 cycles  |  max |R|-err: 2.932e-04 OK  |  sub-diag: 0.000e+00 OK
+512 B32 async      nt4         | [alg] tiled_dag_hvx [async] ... 14002388 cycles  |  max |R|-err: 2.932e-04 OK  |  sub-diag: 0.000e+00 OK

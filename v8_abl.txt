@@ -1,0 +1,8 @@
+# v8 256x256 B64 ablation (HVX panel). label | cycles | err
+barrier    nt4             | [alg] tiled_dag_hvx [barrier] ... 2027718 cycles  |  max |R|-err: 2.747e-04 OK  |  sub-diag: 0.000e+00 OK
+async      nt4             | [alg] tiled_dag_hvx [async] ... 2024776 cycles  |  max |R|-err: 2.747e-04 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt4             | [alg] tiled_dag_hvx [async_prio] ... 2028439 cycles  |  max |R|-err: 2.747e-04 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt2             | [alg] tiled_dag_hvx [async_prio] ... 2813847 cycles  |  max |R|-err: 2.747e-04 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt6             | [alg] tiled_dag_hvx [async_prio] ... 5305981 cycles  |  max |R|-err: 3.357e-04 OK  |  sub-diag: 0.000e+00 OK
+async_prio nt8             | [alg] tiled_dag_hvx [async_prio] ... 7838151 cycles  |  max |R|-err: 3.357e-04 OK  |  sub-diag: 0.000e+00 OK
+ALL DONE
