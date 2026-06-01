@@ -113,10 +113,50 @@ arithmetic faster than the limited vector parallelism can absorb. A structure-ex
 TSQRT/TSMQR (triangular V, internal-blocking) is the path to make tiling competitive —
 future work, and the strongest lever if real hardware exposes more contexts.
 
+### Step 6 — where does the v7 gain actually come from? (decomposition + shape study)
+
+**Decomposition on SQUARE matrices (nt=4, from `compare_v7_v8.csv`):** the v7-vs-v0
+gain is **~70% the HVX tree-reduction (P1)**, ~30% pivot-overlap+context-alloc, and
+**pure scheduling policy (barrier vs async_prio, identical kernels) is ±1.5% — noise.**
+So on square shapes, "critical-path priority" contributes ~nothing; the reduction is
+the workhorse. (128: red 73.5% of gain; 256: red 67.8%. Persistent-HVX P4 alone ≈1%.)
+
+**BUT on TALL-SKINNY matrices, scheduling policy separates clearly**
+(`v7_tallskinny.txt`, `scripts_v7_tallskinny.sh`; nt=4, identical kernels →
+isolates policy):
+
+| shape | async_prio | barrier | barrier/ap |
+|---|---|---|---|
+| 1024×16 | 268,663 | 303,529 | 1.13× |
+| 1024×32 | 430,811 | 514,201 | 1.19× |
+| 1024×64 | 658,439 | 846,695 | **1.29×** |
+| 2048×16 | 483,751 | 548,827 | 1.13× |
+| 2048×32 | 772,987 | 953,679 | 1.23× |
+| 4096×16 | 919,137 | 1,033,437 | 1.12× |
+| 640×64  | 474,969 | 565,503 | 1.19× |
+
+**Mechanism — the win scales with n (reflector count), not aspect ratio.** Fixed
+m=1024: n=16→1.13×, n=32→1.19×, n=64→1.29×. Fixed m=2048: n=16→1.13×, n=32→1.23×.
+More columns = more reflector-k+1 computations to overlap behind the long (O(m))
+trailing-column updates; pure tall-skinny with tiny n wins ~1.13× and plateaus.
+
+**Framing decision (settled):** the scheduling/priority contribution is REAL but
+**shape-conditioned** — up to **1.29× from policy alone on tall-skinny QR**, which is
+exactly the **overdetermined least-squares / SLSQP regime** the Chatterjee paper
+motivates. Honest claim for the paper:
+> "Critical-path pivot-overlap scheduling of HVX vector contexts yields up to 1.29×
+>  on tall-skinny QR (the least-squares regime), with the benefit growing in the
+>  number of reflectors; on square matrices the HVX horizontal-reduction dominates
+>  and scheduling policy is neutral."
+This keeps "scheduling/priority" defensible (don't claim it for square matrices), and
+pairs naturally with the Phase-1 nt-scaling result (graceful past 4 contexts).
+
 ### Remaining (optional polish)
-- PMU counters + roofline (GFLOP/s vs HVX peak) for both v7 and v8.
-- Structure-exploiting TSQRT/TSMQR (would change the v8 verdict).
+- PMU counters + roofline (GFLOP/s vs HVX peak) for v7.
+- nt-sweep priority ablation on tall-skinny (does the policy gap widen at nt>4?).
 - Real-hardware validation point when the board arrives.
+- (v8 tiled is a recorded boundary/negative result; structure-exploiting TSQRT/TSMQR
+  would be needed to make tiling competitive — future work.)
 
 ---
 

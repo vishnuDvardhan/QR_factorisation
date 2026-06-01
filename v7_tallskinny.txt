@@ -1,0 +1,9 @@
+# v7 async_prio vs barrier on tall-skinny (nt=4). m n | async_prio | barrier | speedup
+m=1024  n=16   | async_prio=268663     | barrier=303529     | barrier/ap=1.130
+m=1024  n=32   | async_prio=430811     | barrier=514201     | barrier/ap=1.194
+m=1024  n=64   | async_prio=658439     | barrier=846695     | barrier/ap=1.286
+m=2048  n=16   | async_prio=483751     | barrier=548827     | barrier/ap=1.135
+m=2048  n=32   | async_prio=772987     | barrier=953679     | barrier/ap=1.234
+m=4096  n=16   | async_prio=919137     | barrier=1033437    | barrier/ap=1.124
+m=640   n=64   | async_prio=474969     | barrier=565503     | barrier/ap=1.191
+ALL DONE
