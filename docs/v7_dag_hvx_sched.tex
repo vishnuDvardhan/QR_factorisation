@@ -54,6 +54,8 @@
 \newcommand{\code}[1]{\texttt{\small #1}}
 \newcommand{\file}[1]{\textcolor{hvxblue}{\texttt{#1}}}
 \newcommand{\vt}{v^{\!\top}}
+\newcommand{\crit}[1]{\textcolor{critcol}{#1}}
+\newcommand{\work}[1]{\textcolor{workcol}{#1}}
 
 \title{\textbf{\code{v7\_dag\_hvx\_sched}}\\[4pt]
 \large DAG-Priority HVX Scheduling for Householder QR on Hexagon v69\\[2pt]
@@ -638,6 +640,151 @@ late in the factorization (little to hide behind) and $C$ is small relative to t
 wide updates --- so the overlap barely helps (measured $\pm1.5\%$). On
 \textbf{tall-skinny} matrices each $U$ is large (long $O(m)$ columns) and there are many
 steps, so the hidden $C$ accumulates --- measured up to $1.29\times$, growing with $n$.
+
+% ===================================================================
+\section{Complete execution dry runs}
+% ===================================================================
+We now trace \emph{both} schedulers, event by event, on one concrete problem ---
+showing which task runs on which thread at which time. This makes the
+\code{barrier}/\code{async\_prio} difference visible as a schedule, not just code.
+
+\paragraph{Setup.} A $6\times4$ matrix, $n_t{=}2$ workers, \code{chunk}=1.
+\[
+A=\begin{bmatrix}
+4&2&-1&3\\ 0&5&2&-2\\ 0&1&4&1\\ 3&-3&0&2\\ 0&2&-2&5\\ 0&1&3&-1
+\end{bmatrix}
+\quad\Rightarrow\quad
+R=\begin{bmatrix}
+-5 & 0.20 & 0.80 & -3.60\\
+ 0 & -6.63& -1.64& -0.11\\
+ 0 & 0    & -5.54&  2.40\\
+ 0 & 0    & 0    &  5.03
+\end{bmatrix}
+\]
+The reflectors are
+$(\alpha,\tau)=(-5,0.0222),\,(-6.63,0.0130),\,(-5.54,0.0196),\,(5.03,0.0356)$ for
+$k=0,1,2,3$. The DAG has \textbf{4 reflector tasks} $T_{kk}$ and \textbf{6 update tasks}
+$T_{kj}$: step $0$ updates cols $\{1,2,3\}$, step $1$ cols $\{2,3\}$, step $2$ col
+$\{3\}$, step $3$ none.
+
+\paragraph{Cost model for the trace.} To keep the timeline readable we charge each
+\textbf{reflector} compute $C{=}4$ time units (it is \emph{scalar}, $O(m)$ --- the
+expensive part) and each \textbf{column update} $U{=}2$ units (HVX, $O(m/32)$). The key
+qualitative fact $C>U$ is exactly the real situation and is what makes hiding $C$ pay.
+Wall-clock totals below are in these units.
+
+\subsection{Dry run A --- \code{barrier}}
+Each step: \textbf{main} computes the reflector (workers idle), then \emph{all} trailing
+columns are dispatched to the two workers, then a barrier. \textbf{Main is idle during
+every update burst.}
+
+\begin{center}\small
+\begin{tabular}{@{}rl@{}}
+\toprule
+\textbf{time} & \textbf{event} \\
+\midrule
+$0$--$4$   & \textbf{M} computes $R_0$\quad(workers idle) \\
+$4$--$6$   & \work{$W_0$}: update col 1\qquad \work{$W_1$}: update col 2 \\
+$6$--$8$   & \work{$W_0$}: update col 3\qquad(\textbf{M} idle $4$--$8$)\quad\textit{barrier} \\
+$8$--$12$  & \textbf{M} computes $R_1$\quad(workers idle) \\
+$12$--$14$ & \work{$W_0$}: update col 2\qquad \work{$W_1$}: update col 3\quad(\textbf{M} idle)\;\textit{barrier} \\
+$14$--$18$ & \textbf{M} computes $R_2$\quad(workers idle) \\
+$18$--$20$ & \work{$W_0$}: update col 3\qquad(\textbf{M} idle)\;\textit{barrier} \\
+$20$--$24$ & \textbf{M} computes $R_3$\quad(no updates; last column) \\
+\midrule
+\multicolumn{2}{r}{\textbf{total $=24$ units}\quad(\textbf{main idle $=8$ units} during bursts)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[h]\centering
+\begin{tikzpicture}[x=0.42cm,yscale=0.8,font=\scriptsize]
+  % axis
+  \draw[->] (0,-0.3) -- (25,-0.3) node[right]{time};
+  \foreach \t in {0,4,8,12,14,18,20,24} \draw (\t,-0.25)--(\t,-0.35) node[below]{\t};
+  % lanes
+  \foreach \y/\lab in {2/M,1/$W_0$,0/$W_1$} \node[anchor=east] at (-0.4,\y){\lab};
+  % M reflectors (red)
+  \foreach \s/\e/\l in {0/4/{$R_0$},8/12/{$R_1$},14/18/{$R_2$},20/24/{$R_3$}}
+    {\fill[critcol!30] (\s,1.7) rectangle (\e,2.3); \node at ({(\s+\e)/2},2){\l};}
+  % idle markers on M
+  \foreach \s/\e in {4/8,12/14,18/20} {\draw[gray,densely dotted] (\s,1.7) rectangle (\e,2.3); \node[gray] at ({(\s+\e)/2},2){\tiny idle};}
+  % workers (blue)
+  \foreach \s/\e/\l in {4/6/{c1},6/8/{c3},12/14/{c2},18/20/{c3}} {\fill[workcol!25] (\s,0.7) rectangle (\e,1.3); \node at ({(\s+\e)/2},1){\l};}
+  \foreach \s/\e/\l in {4/6/{c2},12/14/{c3}} {\fill[workcol!25] (\s,-0.3) rectangle (\e,0.3); \node at ({(\s+\e)/2},0){\l};}
+\end{tikzpicture}
+\caption{\code{barrier} timeline. Red = reflectors on main; dotted = main idle; blue =
+worker updates (c$j$ = column $j$). Main stalls through every update burst; total 24.}
+\end{figure}
+
+\subsection{Dry run B --- \code{async\_prio}}
+Reflector $R_0$ is primed before the loop. Each step: \textbf{main} (1) applies the
+\crit{critical column $k{+}1$} itself on HVX, (2) dispatches only the non-critical
+columns $[k{+}2,n)$, (3) computes the \emph{next} reflector \textbf{while the workers
+run}. Main is never idle.
+
+\begin{center}\small
+\begin{tabular}{@{}rl@{}}
+\toprule
+\textbf{time} & \textbf{event} \\
+\midrule
+$0$--$4$   & \textbf{M} primes $R_0$ (pre-loop) \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{step 0:}}\\
+$4$--$6$   & \crit{\textbf{M}: apply critical col 1} (HVX) \\
+$6$--$8$   & \work{$W_0$}: col 2\quad \work{$W_1$}: col 3\qquad\textbf{M}: compute $R_1$ ($6$--$10$) \crit{$\leftarrow$ overlap} \\
+$10$       & step 0 done (join at $\max(8,10)=10$) \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{step 1:}}\\
+$10$--$12$ & \crit{\textbf{M}: apply critical col 2} (HVX) \\
+$12$--$14$ & \work{$W_0$}: col 3\qquad\textbf{M}: compute $R_2$ ($12$--$16$) \crit{$\leftarrow$ overlap} \\
+$16$       & step 1 done (join at $\max(14,16)=16$) \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{step 2:}}\\
+$16$--$18$ & \crit{\textbf{M}: apply critical col 3} (HVX); no non-critical cols \\
+$18$--$22$ & \textbf{M}: compute $R_3$ \crit{$\leftarrow$ overlap (no workers needed)} \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{step 3:} reflector $R_3$ already in hand; nothing to do}\\
+\midrule
+\multicolumn{2}{r}{\textbf{total $=22$ units}\quad(\textbf{main idle $=0$}; $\mathbf{1.09\times}$ over barrier here)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[h]\centering
+\begin{tikzpicture}[x=0.42cm,yscale=0.8,font=\scriptsize]
+  \draw[->] (0,-0.3) -- (23,-0.3) node[right]{time};
+  \foreach \t in {0,4,6,10,12,16,18,22} \draw (\t,-0.25)--(\t,-0.35) node[below]{\t};
+  \foreach \y/\lab in {2/M,1/$W_0$,0/$W_1$} \node[anchor=east] at (-0.4,\y){\lab};
+  % M: prime R0, crit cols (darker red), overlapped reflectors
+  \fill[critcol!30] (0,1.7) rectangle (4,2.3); \node at (2,2){$R_0$};
+  \foreach \s/\e/\l in {4/6/{\crit{c1}},10/12/{\crit{c2}},16/18/{\crit{c3}}}
+    {\fill[critcol!55] (\s,1.7) rectangle (\e,2.3); \node at ({(\s+\e)/2},2){\l};}
+  \foreach \s/\e/\l in {6/10/{$R_1$},12/16/{$R_2$},18/22/{$R_3$}}
+    {\fill[critcol!25] (\s,1.0) rectangle (\e,1.6); \node at ({(\s+\e)/2},1.3){\l};} % offset to show overlap
+  % workers
+  \foreach \s/\e/\l in {6/8/{c2}} {\fill[workcol!25] (\s,0.7) rectangle (\e,1.3); \node at ({(\s+\e)/2},1){\l};}
+  \foreach \s/\e/\l in {6/8/{c3},12/14/{c3}} {\fill[workcol!25] (\s,-0.3) rectangle (\e,0.3); \node at ({(\s+\e)/2},0){\l};}
+  \node[critcol,anchor=west,font=\tiny] at (12.4,1.3){overlapped reflector (on M, under workers)};
+\end{tikzpicture}
+\caption{\code{async\_prio} timeline. Dark red = the critical column done by main first;
+light red bars (slightly lowered) = the next reflector computed \emph{underneath} the
+workers. Main never idles; total 22 vs.\ barrier's 24.}
+\end{figure}
+
+\paragraph{Reading the two traces together.}
+\begin{itemize}\itemsep2pt
+\item \textbf{barrier} pays $C$ \emph{serially} every step (8 units of pure main-idle
+across the run) --- the reflector and the updates never overlap.
+\item \textbf{async\_prio} converts that idle into useful work: main does the one
+critical column, then builds the next reflector while the workers clear the tail.
+The per-step path becomes $U_{\text{crit}}+\max(C,\,\lceil(w{-}1)/p\rceil U)$ instead of
+$C+\lceil w/p\rceil U$.
+\item The gap here is small ($1.09\times$) because this toy is nearly square ($n{=}4$):
+the update tails are short, so there is little to hide $C$ behind. \emph{Scale the same
+trace to a tall-skinny matrix} --- each $U$ grows (long columns) and there are many more
+steps --- and the hidden $C$ accumulates into the measured up-to-$1.29\times$.
+\end{itemize}
 
 % ===================================================================
 \section{Numerical / performance results}
