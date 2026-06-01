@@ -41,6 +41,7 @@
 
 \newcommand{\code}[1]{\texttt{\small #1}}
 \newcommand{\file}[1]{\textcolor{hvxblue}{\texttt{#1}}}
+\newcommand{\vt}{v^{\!\top}}
 
 \title{\textbf{\code{v7\_dag\_hvx\_sched}}\\[4pt]
 \large DAG-Priority HVX Scheduling for Householder QR on Hexagon v69\\[2pt]
@@ -556,6 +557,182 @@ Makefile:
 \end{center}
 with \code{build/inparams.txt} holding \code{m n nt chunk sched nb}
 (\code{sched}: 0 = \code{async\_prio}, 1 = \code{barrier}).
+
+% ===================================================================
+\section{Appendix: complete pseudocode}
+% ===================================================================
+This appendix gives pseudocode for \emph{every} routine in
+\file{v7\_dag\_hvx\_sched.c}, in dependency order, faithful to the source. Shared
+state of the thread pool is the global record $g$ (fields named as in the C
+\code{ThreadPool} struct).
+
+\subsection{HVX numeric helpers (\file{hvx\_utils.h})}
+
+\begin{algorithm}[H]
+\caption{\textsc{HvxReduceQf32}$(\mathbf{s})$ --- horizontal sum of a 32-lane accumulator}
+\KwIn{$\mathbf{s}$: 32-lane \code{qf32} vector of partial sums}
+\KwOut{scalar $\sum_{\ell} \mathbf{s}[\ell]$}
+$\mathbf{v} \gets \textsc{qf32\_to\_sf}(\mathbf{s})$\;
+\For{$r \in \langle 64,32,16,8,4\rangle$ \textnormal{(byte rotates; $\log_2 32 = 5$ stages)}}{
+  $\mathbf{h} \gets \textsc{RotateBytes}(\mathbf{v}, r)$\;
+  $\mathbf{v} \gets \textsc{qf32\_to\_sf}\big(\mathbf{v} \boxplus \mathbf{h}\big)$ \tcp*{lanewise qf32 add}
+}
+\Return $\mathbf{v}[0]$ \tcp*{lane 0 now holds the full sum}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{HvxDotColV}$(a, v, m)$ --- vectorized dot product $\vt a$}
+$\mathbf{acc} \gets \mathbf{0}$ \tcp*{32-lane qf32 accumulator}
+\For{$i \gets 0$ \KwTo $m-1$ \textbf{step} $32$}{
+  $\mathbf{acc} \gets \mathbf{acc} \boxplus \big(\textsc{load}_{32}(a{+}i) \boxtimes \textsc{load}_{32}(v{+}i)\big)$ \tcp*{qf32 fma}
+}
+\Return \textsc{HvxReduceQf32}$(\mathbf{acc})$\;
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{HvxColNormSq}$(c, m, k_{\mathrm{start}})$ --- $\lVert c[k_{\mathrm{start}}{:}m]\rVert^2$}
+$\mathbf{acc} \gets \mathbf{0}$\;
+\For{$i \gets k_{\mathrm{start}}$ \KwTo $m-1$ \textbf{step} $32$}{
+  $\mathbf{acc} \gets \mathbf{acc} \boxplus \big(\textsc{load}_{32}(c{+}i)\big)^{\boxtimes 2}$\;
+}
+\Return \textsc{HvxReduceQf32}$(\mathbf{acc})$ \tcp*{requires $32 \mid k_{\mathrm{start}}$}
+\end{algorithm}
+
+\subsection{Trailing-column update kernels}
+
+\begin{algorithm}[H]
+\caption{\textsc{ApplyColHvx}$(A, v, \tau, j, m)$ --- $A[:,j] \mathrel{-}= \tau(\vt A[:,j])\,v$}
+$a \gets \&A[0,j]$ \tcp*{column $j$ is contiguous (column-major)}
+$\text{dot} \gets \textsc{HvxDotColV}(a, v, m)$;\quad $w \gets \tau\cdot\text{dot}$\;
+$\mathbf{w} \gets \textsc{Splat}(w)$ \tcp*{broadcast scalar to 32 lanes}
+\For{$i \gets 0$ \KwTo $m-1$ \textbf{step} $32$}{
+  $\textsc{store}_{32}\big(a{+}i,\; \textsc{load}_{32}(a{+}i) \boxminus (\mathbf{w} \boxtimes \textsc{load}_{32}(v{+}i))\big)$\;
+}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{ApplyColScalar}$(A, v, \tau, j, m)$ --- identical math, no HVX (fallback)}
+$a \gets \&A[0,j]$;\quad $\text{dot} \gets \sum_{i=0}^{m-1} v[i]\,a[i]$;\quad $w \gets \tau\cdot\text{dot}$\;
+\lForEach{$i \in [0,m)$}{$a[i] \mathrel{-}= w\,v[i]$}
+\end{algorithm}
+
+\subsection{Reflector computation}
+
+\begin{algorithm}[H]
+\caption{\textsc{ComputeReflector}$(A, m, k) \to (\alpha, \tau, v, \mathrm{valid})$}
+$\mathrm{nxsq} \gets \sum_{i=k}^{m-1} A[i,k]^2$;\quad $\mathrm{nx} \gets \sqrt{\mathrm{nxsq}}$\;
+\lIf{$\mathrm{nx} < 10^{-7}$}{\Return $(\cdot,0,\cdot,\mathbf{false})$ \tcp*[f]{column already zero}}
+$\alpha \gets -\operatorname{sign}(A[k,k])\cdot \mathrm{nx}$\;
+$v[0{:}k] \gets 0$;\quad $v[k{:}m] \gets A[k{:}m,\,k]$;\quad $v[k] \mathrel{-}= \alpha$\;
+$\mathrm{nvsq} \gets \sum_{i=k}^{m-1} v[i]^2$\;
+\lIf{$\mathrm{nvsq} < 10^{-10}$}{\Return $(\cdot,0,\cdot,\mathbf{false})$}
+\Return $(\alpha,\; 2/\mathrm{nvsq},\; v,\; \mathbf{true})$ \tcp*{$v[0{:}k]{=}0$ lets kernels run over $[0,m)$}
+\end{algorithm}
+
+\subsection{Persistent thread pool}
+
+\begin{algorithm}[H]
+\caption{\textsc{PoolInit}$(n_t)$}
+clamp $n_t$ to $[1, \textsc{MaxThreads}]$;\quad $g.n_t \gets n_t$;\quad $g.\mathrm{kind} \gets \textsc{None}$\;
+\textsc{SignalInit}$(g.\mathrm{done\_master})$;\quad \lForEach{$t \in [0,n_t)$}{\textsc{SignalInit}$(g.\mathrm{go}[t])$}
+\For{$t \gets 0$ \KwTo $n_t-1$}{ create worker thread running \textsc{PoolWorker}$(t)$ on a preallocated stack\;}
+$g.\mathrm{running} \gets \mathbf{true}$\;
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{PoolWorker}$(\mathrm{tid})$ --- runs for the program's lifetime}
+\While{\textbf{true}}{
+  \textsc{SignalWait}$(g.\mathrm{go}[\mathrm{tid}])$;\quad \textsc{SignalClear}$(g.\mathrm{go}[\mathrm{tid}])$\;
+  \lIf{$g.\mathrm{kind} = \textsc{Shutdown}$}{\textbf{break}}
+  \lIf{$g.\mathrm{kind} = \textsc{ColHH}$}{\textsc{PoolDoColHH}$()$}
+  $r \gets \textsc{AtomicDec}(g.\mathrm{done\_count})$\;
+  \lIf{$r = 0$}{\textsc{SignalSet}$(g.\mathrm{done\_master})$ \tcp*[f]{last one out wakes the driver}}
+}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{PoolDoColHH}$()$ --- worker body: ascending claim, budgeted HVX, publish}
+$\mathrm{got} \gets 0$ \tcp*{0 unclaimed, $1$ holds HVX context, $-1$ scalar}
+\While{\textbf{true}}{
+  $\mathrm{ci} \gets \textsc{AtomicInc}(g.\mathrm{hh\_counter}) - 1$ \tcp*{ascending = priority order}
+  $\mathrm{base} \gets g.\mathrm{hh\_col\_start} + \mathrm{ci}\cdot g.\mathrm{chunk}$\;
+  \lIf{$\mathrm{base} \ge g.\mathrm{hh\_col\_end}$}{\textbf{break}}
+  $\mathrm{end} \gets \min(\mathrm{base}+g.\mathrm{chunk},\; g.\mathrm{hh\_col\_end})$\;
+  \If{$\mathrm{got} = 0$}{
+    $\mathrm{slot} \gets \textsc{AtomicInc}(g.\mathrm{hvx\_claim})$\;
+    \eIf{$\mathrm{slot} \le g.\mathrm{hvx\_worker\_units}$ \textbf{and} \textsc{HvxLock}$()$ succeeds}{$\mathrm{got} \gets 1$}{$\mathrm{got} \gets -1$ \tcp*[f]{over budget $\Rightarrow$ scalar}}
+  }
+  \For{$j \gets \mathrm{base}$ \KwTo $\mathrm{end}-1$}{
+    \leIf{$\mathrm{got}=1$}{\textsc{ApplyColHvx}$(g.A, g.v, g.\tau, j, m)$}{\textsc{ApplyColScalar}$(\cdots)$}
+    \textsc{MemoryBarrier}$()$;\quad $g.\mathrm{col\_done}[j] \gets 1$ \tcp*{publish for the driver}
+  }
+}
+\lIf{$\mathrm{got}=1$}{\textsc{HvxUnlock}$()$}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{PoolDispatchNonblocking}$(A, v, \tau, c_s, c_e, \mathrm{chunk}) \to \mathrm{dispatched}$}
+\lIf{$c_e \le c_s$ \textbf{or} $\lnot g.\mathrm{running}$}{\Return $0$}
+\lForEach{$j \in [c_s, c_e)$}{$g.\mathrm{col\_done}[j] \gets 0$}
+set job descriptor: $g.\{\mathrm{kind}{=}\textsc{ColHH}, A, v, \tau, \mathrm{hh\_col\_start}{=}c_s, \mathrm{hh\_col\_end}{=}c_e, \mathrm{chunk}\}$\;
+$g.\mathrm{hh\_counter} \gets 0$;\quad $g.\mathrm{hvx\_claim} \gets 0$;\quad $g.\mathrm{done\_count} \gets g.n_t$\;
+\textsc{SignalClear}$(g.\mathrm{done\_master})$;\quad \lForEach{$t \in [0,n_t)$}{\textsc{SignalSet}$(g.\mathrm{go}[t])$}
+\Return $1$ \tcp*{returns immediately; workers now running}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{PoolWaitDone}$()$ and \textsc{PoolShutdown}$()$}
+\textbf{PoolWaitDone:} \textsc{SignalWait}$(g.\mathrm{done\_master})$\;
+\smallskip
+\textbf{PoolShutdown:} $g.\mathrm{kind} \gets \textsc{Shutdown}$;\quad $g.\mathrm{done\_count} \gets g.n_t$;\quad signal every \code{go}; join all workers; destroy signals\;
+\end{algorithm}
+
+\subsection{Schedulers (drivers)}
+
+\begin{algorithm}[H]
+\caption{\textsc{QrDagBarrier}$(A)$ --- reference schedule (no overlap)}
+$g.\mathrm{hvx\_worker\_units} \gets \textsc{HvxUnits}$ \tcp*{workers may use all 4 contexts}
+\For{$k \gets 0$ \KwTo $n-1$}{
+  $(\alpha,\tau,v,\mathrm{ok}) \gets \textsc{ComputeReflector}(A,m,k)$;\quad \lIf{$\lnot\mathrm{ok}$}{\textbf{continue}}
+  $d \gets \textsc{PoolDispatchNonblocking}(A,v,\tau,\,k{+}1,\,n,\,\mathrm{chunk})$\;
+  \lIf{$d$}{\textsc{PoolWaitDone}$()$ \tcp*[f]{full barrier on step $k$}}
+  $A[k,k] \gets \alpha$;\quad $A[k{+}1{:}m,\,k] \gets 0$\;
+}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{\textsc{QrDagAsyncPrio}$(A)$ --- critical-path pivot overlap (the contribution)}
+$g.\mathrm{hvx\_worker\_units} \gets \textsc{HvxUnits}$\;
+allocate double buffers $v_{\mathrm{buf}}[0..1]$;\quad $\mathrm{cur} \gets 0$\;
+$(\alpha_{\mathrm{cur}},\tau_{\mathrm{cur}},v_{\mathrm{cur}},\mathrm{valid}_{\mathrm{cur}}) \gets \textsc{ComputeReflector}(A,m,0)$\;
+\For{$k \gets 0$ \KwTo $n-1$}{
+  $\mathrm{nxt} \gets \mathrm{cur} \oplus 1$;\quad $d \gets 0$\;
+  \tcp{(1) critical task $T(k,k{+}1)$: driver does it now, briefly on HVX}
+  \If{$\mathrm{valid}_{\mathrm{cur}}$ \textbf{and} $k{+}1 < n$}{
+    \leIf{\textsc{HvxLock}$()$ succeeds}{\textsc{ApplyColHvx}$(A,v_{\mathrm{cur}},\tau_{\mathrm{cur}},k{+}1,m)$; \textsc{HvxUnlock}$()$}{\textsc{ApplyColScalar}$(\cdots)$}
+  }
+  \tcp{(2) hand the non-critical columns to the workers (all contexts)}
+  \lIf{$\mathrm{valid}_{\mathrm{cur}}$}{$d \gets \textsc{PoolDispatchNonblocking}(A,v_{\mathrm{cur}},\tau_{\mathrm{cur}},\,k{+}2,\,n,\,\mathrm{chunk})$}
+  \tcp{(3) build the next reflector \emph{underneath} the running workers}
+  \lIf{$k{+}1 < n$}{$(\alpha_{\mathrm{nxt}},\tau_{\mathrm{nxt}},v_{\mathrm{nxt}},\mathrm{valid}_{\mathrm{nxt}}) \gets \textsc{ComputeReflector}(A,m,k{+}1)$}
+  \lIf{$d$}{\textsc{PoolWaitDone}$()$ \tcp*[f]{join workers for $[k{+}2,n)$}}
+  \If{$\mathrm{valid}_{\mathrm{cur}}$}{$A[k,k]\gets\alpha_{\mathrm{cur}}$;\quad $A[k{+}1{:}m,\,k]\gets 0$}
+  $\mathrm{cur} \gets \mathrm{nxt}$\;
+}
+\end{algorithm}
+
+\subsection{Top level}
+
+\begin{algorithm}[H]
+\caption{\textsc{Main}$()$}
+read $\langle m,n,n_t,\mathrm{chunk},\mathrm{sched},\mathrm{nb}\rangle$ from \code{inparams.txt}; validate $32\mid m$, $n\le\textsc{MaxN}$\;
+$\textsc{HvxUnits} \gets (\textsc{HvxGetUnits}() \gg 8)\ \&\ \text{0xff}$ \tcp*{=4 on v69 128B}
+build deterministic test matrix $A_{\mathrm{orig}}$;\quad run + time scalar reference $\to A_{\mathrm{cpu}}$\;
+\textsc{PoolInit}$(n_t)$;\quad $A_{\mathrm{alg}} \gets \textsc{copy}(A_{\mathrm{orig}})$\;
+$t_2 \gets \textsc{Cycles}()$;\quad \leIf{$\mathrm{sched}=\textsc{Barrier}$}{\textsc{QrDagBarrier}$(A_{\mathrm{alg}})$}{\textsc{QrDagAsyncPrio}$(A_{\mathrm{alg}})$} $t_3 \gets \textsc{Cycles}()$\;
+\textsc{PoolShutdown}$()$\;
+report $t_3{-}t_2$;\quad verify $\lVert R\rVert$ vs $A_{\mathrm{cpu}}$ and sub-diagonal residual\;
+\end{algorithm}
 
 % ===================================================================
 \section{Summary}
