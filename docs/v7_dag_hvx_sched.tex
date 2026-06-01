@@ -18,6 +18,18 @@
 \hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=teal!60!black,citecolor=blue}
 \usepackage{caption}
 \captionsetup{font=small,labelfont=bf}
+\usepackage{pdflscape}   % landscape pages for side-by-side code
+
+% diff-style C listings: a "same" line vs added/removed highlights
+\definecolor{addbg}{RGB}{225,245,225}
+\definecolor{delbg}{RGB}{250,228,228}
+\lstdefinestyle{cmini}{
+  language=C, basicstyle=\ttfamily\scriptsize, backgroundcolor=\color{codebg},
+  keywordstyle=\color{hvxblue}\bfseries, commentstyle=\color{hvxgreen}\itshape,
+  stringstyle=\color{hvxred}, numbers=none, frame=none,
+  breaklines=true, showstringspaces=false, columns=fullflexible, tabsize=2,
+  morekeywords={HVX_Vector,uint32_t,uint64_t,int32_t,size_t,inline,Matrix,float}
+}
 
 % ---- colors ----
 \definecolor{hvxblue}{RGB}{30,90,180}
@@ -473,6 +485,159 @@ serial gaps between parallel update bursts (blue). In \code{async\_prio} the nex
 reflector is computed \emph{underneath} the workers' updates, and the critical column is
 done first --- shrinking the per-step critical path.}
 \end{figure}
+
+% ===================================================================
+\section{\code{barrier} vs.\ \code{async\_prio}: side-by-side}
+% ===================================================================
+The two drivers share the same loop skeleton; \code{async\_prio} differs in exactly
+three places. We first show the bodies side by side, then dissect each change as a
+\emph{what / how / why} triple. \textcolor{hvxgreen}{\textbf{Green}} marks lines that
+\code{async\_prio} \emph{adds or changes}; \textcolor{hvxred}{\textbf{red}} marks the
+behavior \code{async\_prio} \emph{removes} relative to \code{barrier}.
+
+\begin{landscape}
+\begin{figure}[p]
+\centering
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}p{0.46\linewidth}@{\hspace{6pt}}!{\color{gray!50}\vrule}@{\hspace{6pt}}p{0.46\linewidth}@{}}
+\multicolumn{1}{c}{\textbf{\code{qr\_dag\_barrier} (reference)}} &
+\multicolumn{1}{c}{\textbf{\code{qr\_dag\_async\_prio} (overlap)}} \\[2pt]
+\hline\\[-6pt]
+% ---------- left: barrier ----------
+\begin{minipage}[t]{\linewidth}
+\begin{lstlisting}[style=cmini]
+g.hvx_worker_units = HVX_UNITS;
+float* v = alloc(m);
+
+
+
+for (k = 0; k < n; k++) {
+
+
+
+  // reflector k computed HERE,
+  // strictly between bursts:
+  if(!compute_reflector(A,m,k,
+        v,&alpha,&tau)) continue;
+
+
+  // dispatch ALL trailing cols
+  d = dispatch(A,v,tau,
+               k+1, n, chunk);
+
+
+  if (d) wait_done();  // barrier
+
+
+  A[k,k] = alpha;
+  zero A[k+1:m, k];
+
+}
+\end{lstlisting}
+\end{minipage}
+&
+% ---------- right: async_prio ----------
+\begin{minipage}[t]{\linewidth}
+\begin{lstlisting}[style=cmini,
+   moredelim={[is][\color{hvxgreen}\bfseries]{@}{@}}]
+g.hvx_worker_units = HVX_UNITS;
+@float* vbuf[2]; int cur=0;@                    @// (A) double buffer@
+@compute_reflector(A,m,0,vbuf[0],...);@         @// prime reflector 0@
+for (k = 0; k < n; k++) {
+  @int nxt = cur ^ 1;@
+  @// (B) do the CRITICAL col k+1 now, on HVX:@
+  @if (valid[cur] && k+1 < n) {@
+  @  if (hvx_lock()==EOK){@
+  @    apply_col_hvx(A,vbuf[cur],tau[cur],k+1,m);@
+  @    hvx_unlock(); }@
+  @  else apply_col_scalar(...);@
+  @}@
+  // dispatch only NON-critical cols:
+  d = dispatch(A,vbuf[cur],tau[cur],
+               @k+2@, n, chunk);
+  @// (C) build reflector k+1 UNDER the workers:@
+  @if (k+1<n) compute_reflector(A,m,k+1,@
+  @                  vbuf[nxt],&alpha[nxt],&tau[nxt]);@
+  if (d) wait_done();  // join cols k+2..n-1
+  if (valid[cur]) {
+    A[k,k] = alpha[cur];
+    zero A[k+1:m, k];
+  }
+  @cur = nxt;@                                  @// swap buffers@
+}
+\end{lstlisting}
+\end{minipage}
+\end{tabular}
+\caption{The two drivers aligned. The skeleton (loop, dispatch, wait, diagonal write)
+is identical. \code{async\_prio} adds the three green regions (A)~double-buffered
+reflectors, (B)~the driver executing the critical column $k{+}1$ itself, and
+(C)~computing reflector $k{+}1$ while the workers run --- and changes the dispatch
+range from $[k{+}1,n)$ to $[k{+}2,n)$ because column $k{+}1$ is already handled in (B).}
+\label{fig:sidebyside}
+\end{figure}
+\end{landscape}
+
+\subsection{Anatomy of every change (what / how / why)}
+
+\begin{table}[h]
+\centering\small
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}p{2.2cm}p{3.4cm}p{3.4cm}p{4.6cm}@{}}
+\toprule
+\textbf{Change} & \textbf{What changes} & \textbf{How} & \textbf{Why} \\
+\midrule
+\textbf{(A) Reflector storage} &
+single buffer \code{v} $\to$ two buffers \code{vbuf[2]} (plus \code{tau[2]},\,\code{alpha[2]},\,\code{valid[2]}) &
+allocate two $m$-vectors; index by \code{cur}; \code{cur\^{}=1} each step &
+Step $k$'s reflector must stay alive (workers are still reading it) \emph{while} step $k{+}1$'s reflector is computed. One buffer would be overwritten mid-flight $\Rightarrow$ a data race. \\
+\midrule
+\textbf{(A$'$) Prime / loop order} &
+reflector now computed for $k{+}1$ \emph{inside} step $k$; reflector $0$ primed before the loop &
+\code{compute\_reflector(...,vbuf[0])} once before; thereafter each iteration produces the \emph{next} reflector &
+To overlap, the next reflector must be built during the current step. The pre-loop prime seeds the pipeline so iteration $k$ always has a ready \code{vbuf[cur]}. \\
+\midrule
+\textbf{(B) Critical column} &
+\emph{new}: the driver applies $H_k$ to column $k{+}1$ itself, on a briefly-held HVX context &
+\code{hvx\_lock(); apply\_col\_hvx(...,k+1); hvx\_unlock();} between the previous join and this dispatch &
+Column $k{+}1$ is the \emph{only} critical-path trailing task (reflector $k{+}1$ reads it). Doing it first, on the now-idle driver thread, removes it from the chain that gates progress. The lock is brief and uncontended (no worker is running yet). \\
+\midrule
+\textbf{(C) Pivot overlap} &
+\emph{new}: \code{compute\_reflector} for $k{+}1$ runs \emph{after} dispatch, \emph{before} wait &
+moved between \code{dispatch} and \code{wait\_done}, so it executes while workers update $[k{+}2,n)$ &
+The reflector computation is scalar and latency-bound; running it underneath the workers' bandwidth-bound updates hides it for free. This is the actual source of the speedup. \\
+\midrule
+\textbf{(D) Dispatch range} &
+\code{[k+1, n)} $\to$ \code{[k+2, n)} &
+change one argument of \code{dispatch} &
+Column $k{+}1$ is already done by (B); re-dispatching it would double-apply $H_k$ (a correctness bug). The workers take only the non-critical tail. \\
+\midrule
+\textbf{(E) What does \emph{not} change} &
+the dispatch/wait protocol, the HVX-context budget, the kernels, the diagonal write &
+--- &
+The pool, the atomic allocator, \code{apply\_col\_hvx}, and the $\lvert R\rvert$ result are identical $\Rightarrow$ the comparison isolates \emph{scheduling policy} alone. \\
+\bottomrule
+\end{tabular}
+\caption{Every difference between the two drivers, and the reason for it. Because only
+the schedule changes (E), any measured cycle difference is attributable to policy, not
+to kernels or numerics.}
+\end{table}
+
+\paragraph{Where the time goes (per step).} Let $C$ = cost of one reflector
+computation (scalar, latency-bound) and $U$ = cost of one trailing-column update
+(HVX, bandwidth-bound), with $p=\min(n_t,4)$ vector contexts. For a step with $w$
+trailing columns:
+\[
+\text{barrier} \approx C + \big\lceil w/p\big\rceil U,
+\qquad
+\text{async\_prio} \approx U_{\text{crit}} + \max\!\big(C,\ \big\lceil (w{-}1)/p\big\rceil U\big).
+\]
+\code{async\_prio} hides $C$ under the workers whenever
+$\lceil (w{-}1)/p\rceil U \gtrsim C$. On \textbf{square} matrices $w$ shrinks toward $0$
+late in the factorization (little to hide behind) and $C$ is small relative to the few
+wide updates --- so the overlap barely helps (measured $\pm1.5\%$). On
+\textbf{tall-skinny} matrices each $U$ is large (long $O(m)$ columns) and there are many
+steps, so the hidden $C$ accumulates --- measured up to $1.29\times$, growing with $n$.
 
 % ===================================================================
 \section{Numerical / performance results}
