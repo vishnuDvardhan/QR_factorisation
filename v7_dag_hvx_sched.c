@@ -592,6 +592,13 @@ typedef struct {
 } CTask;
 
 static int g_ccq_chunk = 8;   /* columns per worker UPD task (amortizes sync) */
+static int g_ccq_main_hvx = 0;/* 0 = main releases its context: workers get ALL
+                               *     units, main does the critical column on
+                               *     scalar.  Measured ~1.33x faster than main
+                               *     holding a context here (the per-step
+                               *     critical column is too small to justify
+                               *     reserving a whole vector unit for main).
+                               * 1 = main holds a context (workers get units-1). */
 
 typedef struct {
     Matrix* A; int m, n, nt;
@@ -808,7 +815,8 @@ static void qr_dag_cc_queue(Matrix* A, int nt) {
     ccq_build_dag(n);
     ccq.remaining = (unsigned)ccq.ntask;
     ccq.done = 0; ccq.hvx_claim = 0;
-    ccq.hvx_worker_units = g_hvx_units_128b - 1;   /* main holds the 4th */
+    /* If main holds a context, workers get units-1; else workers get all. */
+    ccq.hvx_worker_units = g_ccq_main_hvx ? (g_hvx_units_128b - 1) : g_hvx_units_128b;
     if (ccq.hvx_worker_units < 1) ccq.hvx_worker_units = 1;
     /* lock-free ring: capacity = next power of two > ntask (slots are reused as
      * tasks retire, but ntask+slack guarantees no live-slot overwrite). */
@@ -821,7 +829,9 @@ static void qr_dag_cc_queue(Matrix* A, int nt) {
     qurt_sem_init_val(&ccq.wavail, 0);
     qurt_sem_init_val(&ccq.mavail, 0);
 
-    int main_hvx = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
+    /* main holds a context only if configured to; otherwise it leaves all
+     * contexts to the workers and runs its critical column on scalar. */
+    int main_hvx = g_ccq_main_hvx ? (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK) : 0;
 
     qurt_thread_attr_t attr;
     for (int t = 0; t < nt; t++) {
@@ -924,7 +934,10 @@ int main(void) {
     else if (sched == SCHED_ASYNC)         qr_dag_async(&A_alg, chunk, 0);  /* no priority */
     else if (sched == SCHED_ASYNC_PRIO_CC) qr_dag_async_prio_cc(&A_alg, chunk); /* concurrent crit col */
     else if (sched == SCHED_CC_QUEUE)      { g_ccq_chunk = (chunk > 0 ? chunk : 8);
-                                             qr_dag_cc_queue(&A_alg, nt); }   /* concurrent queue, chunk=C */
+                                             /* nb==1 forces main to HOLD a context; any other
+                                              * value uses the default (release = faster here). */
+                                             g_ccq_main_hvx = (nb == 1);
+                                             qr_dag_cc_queue(&A_alg, nt); }   /* concurrent queue */
     else                                   qr_dag_async(&A_alg, chunk, 1);  /* async_prio */
     uint64_t t3 = get_cycles();
     if (use_signal_pool) pool_shutdown();
