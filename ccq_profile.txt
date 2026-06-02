@@ -1,0 +1,4 @@
+# cc_queue(4) vs async_prio(0), n=64 nt=4, vary m. label | cycles | R-err
+async_prio m=128       | [alg] dag_hvx_sched [async_prio] ... 203259 cycles  |  max |R|-err: 3.242e-05 OK  |  sub-diag: 1.054e-06 OK
+cc_queue   m=128       | [alg] dag_hvx_sched [cc_queue] ... 2198049 cycles  |  max |R|-err: 3.242e-05 OK  |  sub-diag: 1.220e-06 OK
+async_prio m=512       | [alg] dag_hvx_sched [async_prio] ... 396978 cycles  |  max |R|-err: 1.221e-04 OK  |  sub-diag: 1.546e-08 OK
