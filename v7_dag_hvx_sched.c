@@ -29,6 +29,18 @@
  *                                 (highest-priority) claimants.
  *    sched=1  SCHED_BARRIER     : v0-equivalent (reflector k+1 only after the
  *                                 whole step-k barrier) — sanity / ablation ref.
+ *    sched=2  SCHED_ASYNC       : same async overlap as ASYNC_PRIO but WITHOUT
+ *                                 critical-path priority — main does no special
+ *                                 critical column and workers claim columns
+ *                                 descending.  Isolates the priority policy
+ *                                 (everything else identical to ASYNC_PRIO).
+ *    sched=3  SCHED_ASYNC_PRIO_CC: async_prio with a CONCURRENT critical column.
+ *                                 Main retains one HVX context, dispatches the
+ *                                 workers (budget = units-1) first, then crunches
+ *                                 column k+1 on its own context in parallel —
+ *                                 so all 4 contexts are busy during the critical
+ *                                 column instead of just 1.  Wins when the
+ *                                 critical column dominates (tall-skinny).
  *
  *  inparams.txt format: m n nt [chunk_size] [sched_mode] [nb]
  * ===================================================================== */
@@ -57,7 +69,8 @@ unsigned int heapSize = 16777216;
 #define DEFAULT_CHUNK   4
 #define DEFAULT_NB      8
 
-enum { SCHED_ASYNC_PRIO = 0, SCHED_BARRIER = 1 };
+enum { SCHED_ASYNC_PRIO = 0, SCHED_BARRIER = 1, SCHED_ASYNC = 2,
+       SCHED_ASYNC_PRIO_CC = 3, SCHED_CC_QUEUE = 4 };
 
 static const char* VARIANT_NAME = "dag_hvx_sched";
 
@@ -193,8 +206,13 @@ typedef struct {
     float                 hh_tau;
     int                   hh_col_start;
     int                   hh_col_end;
-    unsigned int          hh_counter;     /* atomic ascending-column claim */
+    unsigned int          hh_counter;     /* atomic chunk-claim counter */
     int                   hh_chunk_size;
+    /* Claim order: +1 = ascending columns (critical-path-first = priority),
+     * -1 = descending (no priority — the SCHED_ASYNC ablation).  Isolates the
+     * priority-ordering policy: everything else (kernels, overlap, HVX budget)
+     * is identical between async and async_prio. */
+    int                   hh_claim_dir;
 
     /* HVX-context allocation: at most hvx_worker_units workers may hold an
      * HVX context; the rest fall back to scalar.  A worker claims a slot with
@@ -238,20 +256,30 @@ static inline void apply_col_scalar(Matrix* A, const float* v, float tau, int j,
     for (int i = 0; i < m; i++) col_j[i] -= w * v[i];
 }
 
-/* Worker body: claim columns in ascending (priority) order; grab an HVX
- * context on the first claimed chunk via try_lock; publish col_done[j]. */
+/* Worker body: claim a chunk of columns (ascending for async_prio = priority,
+ * descending for async = no priority), grab an HVX context once via the atomic
+ * budget, run the update, and publish col_done[j].
+ *
+ * Claim order is the ONLY difference between the async and async_prio policies:
+ * the i-th claimed chunk (atomic ci = 0,1,2,...) maps to the chunk that many
+ * steps in from the start (dir=+1) or from the end (dir=-1) of [col_start,
+ * col_end).  Same single atomic counter, so no new races. */
 static void pool_do_col_hh(void) {
     Matrix* A = g_pool.hh_A;
     int m     = A->m;
     int chunk = g_pool.hh_chunk_size;
     const float* v = g_pool.hh_v;
     float tau = g_pool.hh_tau;
+    int dir   = g_pool.hh_claim_dir;     /* +1 ascending (prio), -1 descending */
+    int nchunk = (g_pool.hh_col_end - g_pool.hh_col_start + chunk - 1) / chunk;
     int got_hvx = 0;   /* 0 = not yet claimed, 1 = holds context, -1 = scalar */
 
     while (1) {
         unsigned int ci = qurt_atomic_inc_return(&g_pool.hh_counter) - 1;
-        int col_base    = g_pool.hh_col_start + (int)ci * chunk;
-        if (col_base >= g_pool.hh_col_end) break;
+        if ((int)ci >= nchunk) break;
+        /* chunk index within the range, ascending or descending */
+        int cidx = (dir >= 0) ? (int)ci : (nchunk - 1 - (int)ci);
+        int col_base    = g_pool.hh_col_start + cidx * chunk;
         int col_end_c   = col_base + chunk;
         if (col_end_c > g_pool.hh_col_end) col_end_c = g_pool.hh_col_end;
 
@@ -320,9 +348,12 @@ static void pool_shutdown(void) {
 }
 
 /* Fire the trailing-column updates for columns [col_start,col_end) but DO
- * NOT block.  Returns 1 if workers were dispatched, 0 if there was no work. */
+ * NOT block.  claim_dir: +1 = workers claim ascending columns (critical-path
+ * priority), -1 = descending (no priority).  Returns 1 if workers were
+ * dispatched, 0 if there was no work. */
 static int pool_dispatch_nonblocking(Matrix* A, const float* v, float tau,
-                                     int col_start, int col_end, int chunk_size) {
+                                     int col_start, int col_end, int chunk_size,
+                                     int claim_dir) {
     if (col_end <= col_start || !g_pool_running) return 0;
     if (chunk_size < 1) chunk_size = 1;
     for (int j = col_start; j < col_end; j++) g_pool.col_done[j] = 0;
@@ -335,6 +366,7 @@ static int pool_dispatch_nonblocking(Matrix* A, const float* v, float tau,
     g_pool.hh_counter    = 0;
     g_pool.hvx_claim     = 0;        /* reset HVX-context slot counter */
     g_pool.hh_chunk_size = chunk_size;
+    g_pool.hh_claim_dir  = claim_dir;
     g_pool.done_count    = g_pool.nt;
     qurt_signal_clear(&g_pool.done_master, 1u);
     for (int t = 0; t < g_pool.nt; t++) qurt_signal_set(&g_pool.go[t], 1u);
@@ -349,20 +381,29 @@ static void pool_wait_done(void) {
  *  Drivers
  * ===================================================================== */
 
-/* SCHED_ASYNC_PRIO: critical-path pivot overlap WITHOUT busy-waiting.
+/* Async pivot overlap WITHOUT busy-waiting, shared by two policies:
  *
- * Key lesson from the first cut: spinning the main thread on col_done[k+1]
- * is catastrophic on this in-order SMT DSP (it steals a HW-thread slot and
- * memory bandwidth from the HVX workers — measured ~5x slowdown).  Instead,
- * the main thread *executes the critical column k+1 itself* (the highest-
- * priority task) on a reserved HVX context, then computes reflector k+1,
- * both overlapping the workers that handle the lower-priority columns
- * k+2..n-1.  No spin: the main thread is always doing useful work or asleep.
+ *   prio = 1  (SCHED_ASYNC_PRIO): critical-path priority.  The main thread
+ *             *executes the critical column k+1 itself* on a briefly-held HVX
+ *             context, computes reflector k+1 while the workers handle the
+ *             lower-priority columns k+2..n-1, and the workers claim columns
+ *             ASCENDING (nearest the critical path first).
  *
- * This is exactly "allocate an HVX vector unit to the highest-priority task":
- * one of the (~4) contexts is reserved for the main thread's critical-path
- * column; the rest are handed to workers via try_lock in ascending order. */
-static void qr_dag_async_prio(Matrix* A, int chunk_size) {
+ *   prio = 0  (SCHED_ASYNC): same async double-buffered overlap, but NO
+ *             critical-path priority.  The main thread does NOT special-case
+ *             column k+1; all trailing columns [k+1, n) go to the workers,
+ *             which claim them DESCENDING (no priority ordering).  Reflector
+ *             k+1 still overlaps the workers (that is the async pipelining,
+ *             not the priority).  This is the ablation that isolates the
+ *             *priority* policy: kernels, pool, HVX budget, and the overlap
+ *             of the reflector are all identical to async_prio.
+ *
+ * Key lesson (both): spinning the main thread on col_done[] is catastrophic on
+ * this in-order SMT DSP (~5x slowdown), so the main thread always does useful
+ * work or sleeps.  Workers get ALL HVX contexts; the main thread only locks a
+ * context *briefly* for the critical column in the prio path, when no worker
+ * is active. */
+static void qr_dag_async(Matrix* A, int chunk_size, int prio) {
     int m = A->m, n = A->n;
     float* vbuf[2];
     float  tau[2], alpha[2];
@@ -370,12 +411,8 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
     vbuf[0] = (float*)memalign(128, (size_t)m * sizeof(float));
     vbuf[1] = (float*)memalign(128, (size_t)m * sizeof(float));
     int cur = 0;
+    int dir = prio ? +1 : -1;          /* ascending (priority) vs descending */
 
-    /* Workers get ALL HVX contexts.  The main thread does NOT hold a context
-     * for its lifetime (that starved a worker at nt == #contexts).  Instead it
-     * locks a context *briefly* for the single critical column k+1 — between
-     * the previous step's join and this step's dispatch, when no worker is
-     * active — then releases it before the bulk dispatch + wait. */
     g_pool.hvx_worker_units = g_hvx_units_128b;
 
     valid[cur] = compute_reflector(A, m, 0, vbuf[cur], &alpha[cur], &tau[cur]);
@@ -383,10 +420,13 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
     for (int k = 0; k < n; k++) {
         int nxt = cur ^ 1;
         int dispatched = 0;
+        /* prio: main does the critical col k+1 itself, workers take [k+2,n).
+         * non-prio: main does no special column, workers take all of [k+1,n). */
+        int col_first = prio ? (k + 2) : (k + 1);
 
-        /* Critical-path task T(k,k+1): update column k+1 first, on HVX, while
-         * no workers hold a context (prev step already joined). */
-        if (valid[cur] && k + 1 < n) {
+        if (prio && valid[cur] && k + 1 < n) {
+            /* Critical-path task T(k,k+1): update column k+1 first, on HVX,
+             * while no workers hold a context (prev step already joined). */
             if (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK) {
                 apply_col_hvx(A, vbuf[cur], tau[cur], k + 1, m);
                 qurt_hvx_unlock();
@@ -395,17 +435,27 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
             }
         }
 
-        /* Workers take the lower-priority columns [k+2, n) with all contexts. */
         if (valid[cur])
             dispatched = pool_dispatch_nonblocking(A, vbuf[cur], tau[cur],
-                                                   k + 2, n, chunk_size);
+                                                   col_first, n, chunk_size, dir);
 
-        /* Reflector k+1 is pure scalar — overlaps the workers' HVX updates. */
-        if (k + 1 < n)
-            valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
-                                           &alpha[nxt], &tau[nxt]);
-
-        if (dispatched) pool_wait_done();    /* join workers for cols k+2..n-1 */
+        /* Reflector k+1 reads column k+1.  In the prio path the main thread has
+         * already finished column k+1 itself (above), so computing reflector
+         * k+1 NOW safely overlaps the workers (who only touch k+2..n-1).  In the
+         * non-prio path the workers own column k+1, so we must JOIN first to
+         * avoid reading a half-updated column — overlap is therefore only
+         * available to the priority policy. */
+        if (prio) {
+            if (k + 1 < n)
+                valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
+                                               &alpha[nxt], &tau[nxt]);
+            if (dispatched) pool_wait_done();
+        } else {
+            if (dispatched) pool_wait_done();   /* join: column k+1 now final */
+            if (k + 1 < n)
+                valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
+                                               &alpha[nxt], &tau[nxt]);
+        }
 
         if (valid[cur]) {
             MAT(*A, k, k) = alpha[cur];
@@ -413,6 +463,70 @@ static void qr_dag_async_prio(Matrix* A, int chunk_size) {
         }
         cur = nxt;
     }
+
+    free(vbuf[0]); free(vbuf[1]);
+}
+
+/* SCHED_ASYNC_PRIO_CC: identical to async_prio, EXCEPT the main thread holds
+ * its single HVX context across the WHOLE critical path instead of locking and
+ * unlocking it once per step.  The critical path here is the diagonal chain of
+ * reflectors/critical-columns the main thread walks — i.e. the entire k-loop —
+ * so "critical path complete" == "the loop has finished".  Main therefore locks
+ * the context once before the loop and unlocks once after it.
+ *
+ * Everything else is copied verbatim from async_prio (prio=1): main applies the
+ * critical column k+1 itself, dispatches [k+2,n) to the workers (which use the
+ * remaining contexts), and computes reflector k+1 overlapping the workers. */
+static void qr_dag_async_prio_cc(Matrix* A, int chunk_size) {
+    int m = A->m, n = A->n;
+    float* vbuf[2];
+    float  tau[2], alpha[2];
+    int    valid[2];
+    vbuf[0] = (float*)memalign(128, (size_t)m * sizeof(float));
+    vbuf[1] = (float*)memalign(128, (size_t)m * sizeof(float));
+    int cur = 0;
+
+    /* Workers get all-but-one context; main reserves the remaining one for the
+     * whole critical path. */
+    int worker_units = g_hvx_units_128b - 1;
+    if (worker_units < 1) worker_units = 1;
+    g_pool.hvx_worker_units = worker_units;
+
+    /* (***the only change vs async_prio***) lock the critical-path context ONCE,
+     * up front, and hold it for the entire k-loop. */
+    int main_hvx = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
+
+    valid[cur] = compute_reflector(A, m, 0, vbuf[cur], &alpha[cur], &tau[cur]);
+
+    for (int k = 0; k < n; k++) {
+        int nxt = cur ^ 1;
+        int dispatched = 0;
+
+        /* critical column k+1 on main's already-held context (no per-step lock) */
+        if (valid[cur] && k + 1 < n) {
+            if (main_hvx) apply_col_hvx(A, vbuf[cur], tau[cur], k + 1, m);
+            else          apply_col_scalar(A, vbuf[cur], tau[cur], k + 1, m);
+        }
+
+        if (valid[cur])
+            dispatched = pool_dispatch_nonblocking(A, vbuf[cur], tau[cur],
+                                                   k + 2, n, chunk_size, +1);
+
+        if (k + 1 < n)
+            valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
+                                           &alpha[nxt], &tau[nxt]);
+
+        if (dispatched) pool_wait_done();
+
+        if (valid[cur]) {
+            MAT(*A, k, k) = alpha[cur];
+            for (int i = k + 1; i < m; i++) MAT(*A, i, k) = 0.f;
+        }
+        cur = nxt;
+    }
+
+    /* critical path complete -> release the context. */
+    if (main_hvx) qurt_hvx_unlock();
 
     free(vbuf[0]); free(vbuf[1]);
 }
@@ -426,12 +540,268 @@ static void qr_dag_barrier(Matrix* A, int chunk_size) {
     for (int k = 0; k < n; k++) {
         float alpha, tau;
         if (!compute_reflector(A, m, k, v, &alpha, &tau)) continue;
-        int dispatched = pool_dispatch_nonblocking(A, v, tau, k + 1, n, chunk_size);
+        int dispatched = pool_dispatch_nonblocking(A, v, tau, k + 1, n,
+                                                   chunk_size, +1);
         if (dispatched) pool_wait_done();
         MAT(*A, k, k) = alpha;
         for (int i = k + 1; i < m; i++) MAT(*A, i, k) = 0.f;
     }
     free(v);
+}
+
+/* =====================================================================
+ *  SCHED_CC_QUEUE — concurrent task-DAG scheduler (v8-proven model) with an
+ *  HVX-accelerated critical path.
+ *
+ *  We pre-build the FULL task DAG up front with predecessor counts, then run
+ *  it with a shared ready-queue: a task is pushed only when all its
+ *  predecessors are done (no requeue, no run-ahead ring, no busy-wait).  This
+ *  is the exact pattern proven correct in v8_tiled_dag_hvx.c.
+ *
+ *  Two task kinds (unblocked, column granularity):
+ *    REFL(k)   : compute reflector k (scalar) + write the diagonal/subdiagonal
+ *                of column k.  Reads column k.
+ *    UPD(k,j)  : apply reflector k to trailing column j  (k < j < n).
+ *
+ *  Dependencies (column last-writer):
+ *    REFL(k)  <- last writer of column k  (= UPD(k-1,k), the critical column)
+ *    UPD(k,j) <- REFL(k)                  (reflector must exist)
+ *             <- last writer of column j  (= UPD(k-1,j), inter-step order)
+ *  Critical path = REFL(0) -> UPD(0,1) -> REFL(1) -> UPD(1,2) -> ...
+ *
+ *  HVX-accelerated critical path: the MAIN thread executes the critical-path
+ *  tasks itself — every REFL(k) (scalar) and every critical column UPD(k,k+1)
+ *  (on a held HVX context) — so reflectors are produced as fast as possible and
+ *  downstream UPD tasks become ready sooner, widening the parallel front.  The
+ *  WORKERS execute the non-critical UPD(k,j>k+1) tasks pulled from the queue.
+ *
+ *  Scheduling: when a task completes it decrements each successor's pred count;
+ *  a successor hitting 0 is routed to MAIN (if it is a critical-path task) or to
+ *  the worker queue (otherwise).  Main blocks on its own semaphore for the next
+ *  critical-path task; workers block on the shared queue semaphore.
+ * ===================================================================== */
+enum { CK_REFL = 0, CK_UPD = 1 };
+
+typedef struct {
+    uint8_t  kind;            /* CK_REFL / CK_UPD */
+    int      k, j;            /* REFL uses k; UPD uses (k,j) */
+    int      crit;            /* 1 = on the critical path (main executes) */
+    int      npred;
+    volatile int pred;        /* remaining predecessors (atomic countdown) */
+    int      soff, scnt;      /* CSR successor slice */
+} CTask;
+
+typedef struct {
+    Matrix* A; int m, n, nt;
+    CTask*  task; int ntask;
+    int*    succ;             /* CSR successor ids */
+    float*  vstore;           /* reflector storage: n vectors of length m */
+    float*  taustore;         /* n taus */
+    /* worker ready-queue (FIFO ring) */
+    int*    wq; int wcap; volatile int whead, wtail, wcount;
+    qurt_mutex_t wmtx; qurt_sem_t wavail;
+    /* main's critical-path ready signal (single consumer) */
+    qurt_sem_t mavail; volatile int mready;   /* next critical task id, -1 none */
+    qurt_mutex_t mmtx;
+    volatile unsigned remaining;
+    volatile int done;
+    volatile unsigned hvx_claim; int hvx_worker_units;
+} CCQ;
+
+static CCQ ccq;
+static qurt_thread_t ccq_tids[MAX_THREADS];
+
+static inline float* CCQ_V(int k) { return ccq.vstore + (size_t)k * ccq.m; }
+
+/* ---- ready routing ---- */
+static void ccq_worker_push(int id) {
+    qurt_mutex_lock(&ccq.wmtx);
+    ccq.wq[ccq.wtail] = id; ccq.wtail = (ccq.wtail + 1) % ccq.wcap; ccq.wcount++;
+    qurt_mutex_unlock(&ccq.wmtx);
+    qurt_sem_up(&ccq.wavail);
+}
+static int ccq_worker_pop(void) {
+    qurt_sem_down(&ccq.wavail);
+    qurt_mutex_lock(&ccq.wmtx);
+    if (ccq.wcount == 0) { qurt_mutex_unlock(&ccq.wmtx); return -1; }
+    int id = ccq.wq[ccq.whead]; ccq.whead = (ccq.whead + 1) % ccq.wcap; ccq.wcount--;
+    qurt_mutex_unlock(&ccq.wmtx);
+    return id;
+}
+/* route a now-ready task to main (critical) or the worker queue (non-critical) */
+static void ccq_make_ready(int id) {
+    if (ccq.task[id].crit) {
+        qurt_mutex_lock(&ccq.mmtx);
+        ccq.mready = id;
+        qurt_mutex_unlock(&ccq.mmtx);
+        qurt_sem_up(&ccq.mavail);
+    } else {
+        ccq_worker_push(id);
+    }
+}
+
+/* execute one UPD task on the given HVX/scalar path */
+static inline void ccq_exec_upd(int id, int use_hvx) {
+    const CTask* t = &ccq.task[id];
+    if (use_hvx) apply_col_hvx(ccq.A, CCQ_V(t->k), ccq.taustore[t->k], t->j, ccq.m);
+    else         apply_col_scalar(ccq.A, CCQ_V(t->k), ccq.taustore[t->k], t->j, ccq.m);
+}
+
+/* on completion of task id: decrement successors, route those that hit 0, and
+ * signal global done when all tasks are retired. */
+static void ccq_complete(int id) {
+    const CTask* t = &ccq.task[id];
+    for (int e = 0; e < t->scnt; e++) {
+        int s = ccq.succ[t->soff + e];
+        int left = (int)qurt_atomic_add_return((unsigned*)&ccq.task[s].pred, -1u);
+        if (left == 0) ccq_make_ready(s);
+    }
+    unsigned rem = qurt_atomic_add_return((unsigned*)&ccq.remaining, -1u);
+    if (rem == 0) {
+        ccq.done = 1;
+        for (int x = 0; x < ccq.nt; x++) qurt_sem_up(&ccq.wavail); /* wake workers to exit */
+        qurt_sem_up(&ccq.mavail);                                  /* unblock main if waiting */
+    }
+}
+
+static void ccq_worker(void* arg) {
+    int tid = (int)(intptr_t)arg; (void)tid;
+    int got_hvx = 0;
+    while (1) {
+        int id = ccq_worker_pop();
+        if (id < 0) break;
+        if (got_hvx == 0) {
+            unsigned slot = qurt_atomic_inc_return(&ccq.hvx_claim);
+            if ((int)slot <= ccq.hvx_worker_units &&
+                qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK) got_hvx = 1;
+            else got_hvx = -1;
+        }
+        ccq_exec_upd(id, got_hvx == 1);
+        ccq_complete(id);
+    }
+    if (got_hvx == 1) qurt_hvx_unlock();
+    qurt_thread_exit(0);
+}
+
+/* ---- DAG construction (sequential-order trace + per-column last writer) ---- */
+static int* ccq_esrc; static int* ccq_edst; static int ccq_ne;
+static void ccq_add_edge(int s, int d) {
+    if (s < 0) return;
+    ccq_esrc[ccq_ne] = s; ccq_edst[ccq_ne] = d; ccq_ne++;
+    ccq.task[d].npred++;
+}
+static void ccq_build_dag(int n) {
+    /* tasks: n REFL + n(n-1)/2 UPD */
+    int tmax = n + n * (n - 1) / 2 + 1;
+    ccq.task = (CTask*)calloc(tmax, sizeof(CTask));
+    ccq_esrc = (int*)malloc((size_t)3 * tmax * sizeof(int));
+    ccq_edst = (int*)malloc((size_t)3 * tmax * sizeof(int));
+    int* lw = (int*)malloc((size_t)n * sizeof(int));   /* last writer per column */
+    for (int j = 0; j < n; j++) lw[j] = -1;
+    int nt_ = 0; ccq_ne = 0;
+
+    for (int k = 0; k < n; k++) {
+        /* REFL(k): reads column k; depends on column k's last writer */
+        int rid = nt_++;
+        ccq.task[rid].kind = CK_REFL; ccq.task[rid].k = k; ccq.task[rid].crit = 1;
+        ccq_add_edge(lw[k], rid);
+        lw[k] = rid;                              /* REFL writes column k diag */
+        /* UPD(k,j) for j>k: depends on REFL(k) and column j's last writer */
+        for (int j = k + 1; j < n; j++) {
+            int uid = nt_++;
+            ccq.task[uid].kind = CK_UPD; ccq.task[uid].k = k; ccq.task[uid].j = j;
+            ccq.task[uid].crit = (j == k + 1);    /* critical column = k+1 */
+            ccq_add_edge(rid, uid);
+            ccq_add_edge(lw[j], uid);
+            lw[j] = uid;
+        }
+    }
+    ccq.ntask = nt_;
+
+    /* CSR successor lists */
+    for (int x = 0; x < nt_; x++) ccq.task[x].scnt = 0;
+    for (int e = 0; e < ccq_ne; e++) ccq.task[ccq_esrc[e]].scnt++;
+    int off = 0;
+    for (int x = 0; x < nt_; x++) { ccq.task[x].soff = off; off += ccq.task[x].scnt; }
+    ccq.succ = (int*)malloc((size_t)(ccq_ne ? ccq_ne : 1) * sizeof(int));
+    int* cur = (int*)malloc((size_t)nt_ * sizeof(int));
+    for (int x = 0; x < nt_; x++) cur[x] = ccq.task[x].soff;
+    for (int e = 0; e < ccq_ne; e++) ccq.succ[cur[ccq_esrc[e]]++] = ccq_edst[e];
+    for (int x = 0; x < nt_; x++) ccq.task[x].pred = ccq.task[x].npred;
+    free(lw); free(cur); free(ccq_esrc); free(ccq_edst);
+}
+
+static void qr_dag_cc_queue(Matrix* A, int nt) {
+    int m = A->m, n = A->n;
+    if (nt > MAX_THREADS) nt = MAX_THREADS;
+    if (nt < 1) nt = 1;
+    if (n == 0) return;
+
+    ccq.A = A; ccq.m = m; ccq.n = n; ccq.nt = nt;
+    ccq.vstore   = (float*)memalign(128, (size_t)n * m * sizeof(float));
+    ccq.taustore = (float*)memalign(128, (size_t)n * sizeof(float));
+    ccq_build_dag(n);
+    ccq.remaining = (unsigned)ccq.ntask;
+    ccq.done = 0; ccq.hvx_claim = 0;
+    ccq.hvx_worker_units = g_hvx_units_128b - 1;   /* main holds the 4th */
+    if (ccq.hvx_worker_units < 1) ccq.hvx_worker_units = 1;
+    ccq.wcap = ccq.ntask + 8;
+    ccq.wq = (int*)malloc((size_t)ccq.wcap * sizeof(int));
+    ccq.whead = ccq.wtail = ccq.wcount = 0;
+    ccq.mready = -1;
+    qurt_mutex_init(&ccq.wmtx); qurt_sem_init_val(&ccq.wavail, 0);
+    qurt_mutex_init(&ccq.mmtx); qurt_sem_init_val(&ccq.mavail, 0);
+
+    int main_hvx = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
+
+    qurt_thread_attr_t attr;
+    for (int t = 0; t < nt; t++) {
+        qurt_thread_attr_init(&attr);
+        qurt_thread_attr_set_stack_addr(&attr, thread_stacks[t]);
+        qurt_thread_attr_set_stack_size(&attr, STACK_SIZE);
+        qurt_thread_attr_set_priority(&attr, 100);
+        qurt_thread_create(&ccq_tids[t], &attr, ccq_worker, (void*)(intptr_t)t);
+    }
+
+    /* REFL(0) (task id 0) is the only initially-ready task; it is critical, so
+     * main starts with it directly, then receives each next critical task via
+     * the mavail semaphore. */
+    int next = 0, have_next = 1;
+    while (!ccq.done) {
+        int id;
+        if (have_next) { id = next; have_next = 0; }
+        else {
+            qurt_sem_down(&ccq.mavail);
+            if (ccq.done) break;
+            qurt_mutex_lock(&ccq.mmtx);
+            id = ccq.mready; ccq.mready = -1;
+            qurt_mutex_unlock(&ccq.mmtx);
+            if (id < 0) continue;
+        }
+        CTask* t = &ccq.task[id];
+        if (t->kind == CK_REFL) {
+            int k = t->k;
+            float alpha, tau;
+            int ok = compute_reflector(A, m, k, CCQ_V(k), &alpha, &tau);
+            ccq.taustore[k] = ok ? tau : 0.f;
+            if (ok) {
+                MAT(*A, k, k) = alpha;
+                for (int i = k + 1; i < m; i++) MAT(*A, i, k) = 0.f;
+            } else {
+                for (int i = 0; i < m; i++) CCQ_V(k)[i] = 0.f;  /* tau 0 -> UPD no-op */
+            }
+        } else { /* critical UPD(k,k+1) on main's held context */
+            ccq_exec_upd(id, main_hvx);
+        }
+        ccq_complete(id);
+    }
+
+    if (main_hvx) qurt_hvx_unlock();
+    for (int t = 0; t < nt; t++) { int s; qurt_thread_join(ccq_tids[t], &s); }
+
+    qurt_mutex_destroy(&ccq.wmtx); qurt_sem_destroy(&ccq.wavail);
+    qurt_mutex_destroy(&ccq.mmtx); qurt_sem_destroy(&ccq.mavail);
+    free(ccq.vstore); free(ccq.taustore); free(ccq.task); free(ccq.succ); free(ccq.wq);
 }
 
 /* =====================================================================
@@ -453,7 +823,11 @@ int main(void) {
     (void)nb;
     g_hvx_units_128b = hvx_units_128b();
 
-    const char* sched_name = (sched == SCHED_BARRIER) ? "barrier" : "async_prio";
+    const char* sched_name = (sched == SCHED_BARRIER)        ? "barrier" :
+                             (sched == SCHED_ASYNC)          ? "async"   :
+                             (sched == SCHED_ASYNC_PRIO_CC)  ? "async_prio_cc" :
+                             (sched == SCHED_CC_QUEUE)       ? "cc_queue" :
+                                                               "async_prio";
     printf("=== %s [%s] ===\n", VARIANT_NAME, sched_name);
     printf("Matrix: %d x %d  |  Threads: %d  |  Chunk: %d  |  HVX units(cfg): 0x%x\n\n",
            m, n, nt, chunk, qurt_hvx_get_units());
@@ -468,14 +842,20 @@ int main(void) {
     uint64_t t1 = get_cycles();
     printf("%llu cycles\n", (unsigned long long)(t1 - t0));
 
-    pool_init(nt);
+    /* cc_queue spawns its own drain-loop workers; all other modes use the
+     * persistent signal-pool. */
+    int use_signal_pool = (sched != SCHED_CC_QUEUE);
+    if (use_signal_pool) pool_init(nt);
     Matrix A_alg = copy_matrix(&A_orig);
     printf("[alg] %s [%s] ... ", VARIANT_NAME, sched_name);
     uint64_t t2 = get_cycles();
-    if (sched == SCHED_BARRIER) qr_dag_barrier(&A_alg, chunk);
-    else                        qr_dag_async_prio(&A_alg, chunk);
+    if      (sched == SCHED_BARRIER)       qr_dag_barrier(&A_alg, chunk);
+    else if (sched == SCHED_ASYNC)         qr_dag_async(&A_alg, chunk, 0);  /* no priority */
+    else if (sched == SCHED_ASYNC_PRIO_CC) qr_dag_async_prio_cc(&A_alg, chunk); /* concurrent crit col */
+    else if (sched == SCHED_CC_QUEUE)      qr_dag_cc_queue(&A_alg, nt);     /* concurrent queue */
+    else                                   qr_dag_async(&A_alg, chunk, 1);  /* async_prio */
     uint64_t t3 = get_cycles();
-    pool_shutdown();
+    if (use_signal_pool) pool_shutdown();
 
     float err  = verify_R_against(&A_cpu, &A_alg);
     float sub  = subdiag_residual(&A_alg);

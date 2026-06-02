@@ -1,0 +1,8 @@
+# v7 3-mode verify+timing (mode m n nt | cycles | R-err)
+barrier    256x256     | [alg] dag_hvx_sched [barrier] ... 737393 cycles  |  max |R|-err: 4.959e-05 OK  |  sub-diag: 8.135e-07 OK
+async      256x256     | [alg] dag_hvx_sched [async] ... 745018 cycles  |  max |R|-err: 4.959e-05 OK  |  sub-diag: 8.135e-07 OK
+async_prio 256x256     | [alg] dag_hvx_sched [async_prio] ... 712853 cycles  |  max |R|-err: 4.959e-05 OK  |  sub-diag: 8.135e-07 OK
+async      1024x64     | [alg] dag_hvx_sched [async] ... 866226 cycles  |  max |R|-err: 3.204e-04 OK  |  sub-diag: 4.758e-07 OK
+async_prio 1024x64     | [alg] dag_hvx_sched [async_prio] ... 666273 cycles  |  max |R|-err: 3.204e-04 OK  |  sub-diag: 4.758e-07 OK
+barrier    1024x64     | [alg] dag_hvx_sched [barrier] ... 841481 cycles  |  max |R|-err: 3.204e-04 OK  |  sub-diag: 4.758e-07 OK
+ALL DONE

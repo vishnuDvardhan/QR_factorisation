@@ -1,0 +1,7 @@
+# CC (sched=3) vs async_prio(0) vs barrier(1). nt=4. label | cycles | R-err
+barrier    256x256         | [alg] dag_hvx_sched [barrier] ... 734561 cycles  |  max |R|-err: 4.959e-05 OK  |  sub-diag: 8.135e-07 OK
+async_prio 256x256         | [alg] dag_hvx_sched [async_prio] ... 720991 cycles  |  max |R|-err: 4.959e-05 OK  |  sub-diag: 8.135e-07 OK
+cc         256x256         | [alg] dag_hvx_sched [async_prio_cc] ... 999547 cycles  |  max |R|-err: 6.676e-05 OK  |  sub-diag: 5.691e-11 OK
+barrier    1024x64         | [alg] dag_hvx_sched [barrier] ... 847857 cycles  |  max |R|-err: 3.204e-04 OK  |  sub-diag: 4.758e-07 OK
+async_prio 1024x64         | [alg] dag_hvx_sched [async_prio] ... 669593 cycles  |  max |R|-err: 3.204e-04 OK  |  sub-diag: 4.758e-07 OK
+cc         1024x64         | [alg] dag_hvx_sched [async_prio_cc] ... 1736047 cycles  |  max |R|-err: 3.204e-04 OK  |  sub-diag: 2.995e-10 OK
