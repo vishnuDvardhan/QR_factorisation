@@ -597,12 +597,21 @@ typedef struct {
     int*    succ;             /* CSR successor ids */
     float*  vstore;           /* reflector storage: n vectors of length m */
     float*  taustore;         /* n taus */
-    /* worker ready-queue (FIFO ring) */
-    int*    wq; int wcap; volatile int whead, wtail, wcount;
-    qurt_mutex_t wmtx; qurt_sem_t wavail;
-    /* main's critical-path ready signal (single consumer) */
+    /* LOCK-FREE worker ready-queue: a bounded MPMC ring.  Producers (main +
+     * workers, via ccq_complete) claim a unique slot with one atomic inc of
+     * wpush; consumers (workers) claim with one atomic inc of wpop.  Each slot
+     * has a `ready` flag so a consumer that claims a slot before the producer
+     * has finished writing it spins briefly on the flag.  The counting
+     * semaphore wavail is used ONLY for blocking when the queue is empty
+     * (so idle workers sleep instead of busy-spinning), not for mutual
+     * exclusion — there is no mutex on the hot path. wcap is a power of two. */
+    int*    wq;                 /* slot payload (task id) */
+    volatile int* wflag;        /* per-slot ready flag (0/1) */
+    int     wcap, wmask;        /* capacity (pow2) and mask */
+    volatile unsigned wpush, wpop;
+    qurt_sem_t wavail;
+    /* main's critical-path ready mailbox (single consumer = main) */
     qurt_sem_t mavail; volatile int mready;   /* next critical task id, -1 none */
-    qurt_mutex_t mmtx;
     volatile unsigned remaining;
     volatile int done;
     volatile unsigned hvx_claim; int hvx_worker_units;
@@ -613,27 +622,42 @@ static qurt_thread_t ccq_tids[MAX_THREADS];
 
 static inline float* CCQ_V(int k) { return ccq.vstore + (size_t)k * ccq.m; }
 
-/* ---- ready routing ---- */
+/* ---- lock-free worker ready-queue (bounded MPMC ring) ---- */
 static void ccq_worker_push(int id) {
-    qurt_mutex_lock(&ccq.wmtx);
-    ccq.wq[ccq.wtail] = id; ccq.wtail = (ccq.wtail + 1) % ccq.wcap; ccq.wcount++;
-    qurt_mutex_unlock(&ccq.wmtx);
-    qurt_sem_up(&ccq.wavail);
+    unsigned pos = qurt_atomic_inc_return(&ccq.wpush) - 1;  /* unique slot */
+    int s = (int)(pos & (unsigned)ccq.wmask);
+    ccq.wq[s] = id;
+    __asm__ __volatile__("" ::: "memory");                 /* publish payload */
+    ccq.wflag[s] = 1;                                       /* mark ready */
+    qurt_sem_up(&ccq.wavail);                               /* wake a sleeper */
 }
 static int ccq_worker_pop(void) {
-    qurt_sem_down(&ccq.wavail);
-    qurt_mutex_lock(&ccq.wmtx);
-    if (ccq.wcount == 0) { qurt_mutex_unlock(&ccq.wmtx); return -1; }
-    int id = ccq.wq[ccq.whead]; ccq.whead = (ccq.whead + 1) % ccq.wcap; ccq.wcount--;
-    qurt_mutex_unlock(&ccq.wmtx);
+    /* The semaphore count == (#real items pushed) - (#consumed) until the run
+     * ends; at completion the driver sets done=1 and posts nt extra tokens.  A
+     * worker that wakes after done with no real item left exits.  Invariant:
+     * a consumer only claims a wpop ticket when it KNOWS a real item exists
+     * (it passed sem_down for a real push, not an exit token), so wpop can
+     * never overtake wpush.  We distinguish the two by checking done+frontier
+     * AFTER the wake but BEFORE claiming a ticket. */
+    qurt_sem_down(&ccq.wavail);            /* block while empty (no busy-spin) */
+    /* If everything is retired and we were woken to exit, leave. */
+    if (ccq.done && ccq.wpop >= ccq.wpush) return -1;
+    unsigned pop = qurt_atomic_inc_return(&ccq.wpop) - 1;   /* real item ticket */
+    int s = (int)(pop & (unsigned)ccq.wmask);
+    while (!ccq.wflag[s]) { /* tiny: producer between inc and flag store */ }
+    int id = ccq.wq[s];
+    __asm__ __volatile__("" ::: "memory");
+    ccq.wflag[s] = 0;
     return id;
 }
-/* route a now-ready task to main (critical) or the worker queue (non-critical) */
+/* route a now-ready task to main (critical) or the worker queue (non-critical).
+ * mready is a single-slot mailbox written by at most one producer at a time
+ * (only one critical task is ever ready at once, by DAG construction), so a
+ * plain store + semaphore suffices — no lock. */
 static void ccq_make_ready(int id) {
     if (ccq.task[id].crit) {
-        qurt_mutex_lock(&ccq.mmtx);
         ccq.mready = id;
-        qurt_mutex_unlock(&ccq.mmtx);
+        __asm__ __volatile__("" ::: "memory");
         qurt_sem_up(&ccq.mavail);
     } else {
         ccq_worker_push(id);
@@ -745,12 +769,16 @@ static void qr_dag_cc_queue(Matrix* A, int nt) {
     ccq.done = 0; ccq.hvx_claim = 0;
     ccq.hvx_worker_units = g_hvx_units_128b - 1;   /* main holds the 4th */
     if (ccq.hvx_worker_units < 1) ccq.hvx_worker_units = 1;
-    ccq.wcap = ccq.ntask + 8;
-    ccq.wq = (int*)malloc((size_t)ccq.wcap * sizeof(int));
-    ccq.whead = ccq.wtail = ccq.wcount = 0;
+    /* lock-free ring: capacity = next power of two > ntask (slots are reused as
+     * tasks retire, but ntask+slack guarantees no live-slot overwrite). */
+    int cap = 1; while (cap <= ccq.ntask + nt) cap <<= 1;
+    ccq.wcap = cap; ccq.wmask = cap - 1;
+    ccq.wq    = (int*)malloc((size_t)cap * sizeof(int));
+    ccq.wflag = (volatile int*)calloc((size_t)cap, sizeof(int));
+    ccq.wpush = ccq.wpop = 0;
     ccq.mready = -1;
-    qurt_mutex_init(&ccq.wmtx); qurt_sem_init_val(&ccq.wavail, 0);
-    qurt_mutex_init(&ccq.mmtx); qurt_sem_init_val(&ccq.mavail, 0);
+    qurt_sem_init_val(&ccq.wavail, 0);
+    qurt_sem_init_val(&ccq.mavail, 0);
 
     int main_hvx = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
 
@@ -773,9 +801,11 @@ static void qr_dag_cc_queue(Matrix* A, int nt) {
         else {
             qurt_sem_down(&ccq.mavail);
             if (ccq.done) break;
-            qurt_mutex_lock(&ccq.mmtx);
+            /* single-producer-at-a-time mailbox: at most one critical task is
+             * ready at once (DAG critical path is a chain), so a plain read
+             * with reset is safe — no lock. */
             id = ccq.mready; ccq.mready = -1;
-            qurt_mutex_unlock(&ccq.mmtx);
+            __asm__ __volatile__("" ::: "memory");
             if (id < 0) continue;
         }
         CTask* t = &ccq.task[id];
@@ -799,9 +829,9 @@ static void qr_dag_cc_queue(Matrix* A, int nt) {
     if (main_hvx) qurt_hvx_unlock();
     for (int t = 0; t < nt; t++) { int s; qurt_thread_join(ccq_tids[t], &s); }
 
-    qurt_mutex_destroy(&ccq.wmtx); qurt_sem_destroy(&ccq.wavail);
-    qurt_mutex_destroy(&ccq.mmtx); qurt_sem_destroy(&ccq.mavail);
-    free(ccq.vstore); free(ccq.taustore); free(ccq.task); free(ccq.succ); free(ccq.wq);
+    qurt_sem_destroy(&ccq.wavail); qurt_sem_destroy(&ccq.mavail);
+    free(ccq.vstore); free(ccq.taustore); free(ccq.task); free(ccq.succ);
+    free(ccq.wq); free((void*)ccq.wflag);
 }
 
 /* =====================================================================
