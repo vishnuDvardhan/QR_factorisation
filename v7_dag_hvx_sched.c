@@ -584,12 +584,14 @@ enum { CK_REFL = 0, CK_UPD = 1 };
 
 typedef struct {
     uint8_t  kind;            /* CK_REFL / CK_UPD */
-    int      k, j;            /* REFL uses k; UPD uses (k,j) */
+    int      k, j, jend;      /* REFL uses k; UPD applies reflector k to cols [j,jend) */
     int      crit;            /* 1 = on the critical path (main executes) */
     int      npred;
     volatile int pred;        /* remaining predecessors (atomic countdown) */
     int      soff, scnt;      /* CSR successor slice */
 } CTask;
+
+static int g_ccq_chunk = 8;   /* columns per worker UPD task (amortizes sync) */
 
 typedef struct {
     Matrix* A; int m, n, nt;
@@ -664,11 +666,14 @@ static void ccq_make_ready(int id) {
     }
 }
 
-/* execute one UPD task on the given HVX/scalar path */
+/* execute one UPD task (applies reflector k to all columns [j,jend)) */
 static inline void ccq_exec_upd(int id, int use_hvx) {
     const CTask* t = &ccq.task[id];
-    if (use_hvx) apply_col_hvx(ccq.A, CCQ_V(t->k), ccq.taustore[t->k], t->j, ccq.m);
-    else         apply_col_scalar(ccq.A, CCQ_V(t->k), ccq.taustore[t->k], t->j, ccq.m);
+    const float* v = CCQ_V(t->k); float tau = ccq.taustore[t->k];
+    for (int jj = t->j; jj < t->jend; jj++) {
+        if (use_hvx) apply_col_hvx(ccq.A, v, tau, jj, ccq.m);
+        else         apply_col_scalar(ccq.A, v, tau, jj, ccq.m);
+    }
 }
 
 /* on completion of task id: decrement successors, route those that hit 0, and
@@ -715,13 +720,24 @@ static void ccq_add_edge(int s, int d) {
     ccq.task[d].npred++;
 }
 static void ccq_build_dag(int n) {
-    /* tasks: n REFL + n(n-1)/2 UPD */
-    int tmax = n + n * (n - 1) / 2 + 1;
+    int C = g_ccq_chunk; if (C < 1) C = 1;
+    /* worker UPD tasks are C-aligned column blocks: block b = cols [b*C,b*C+C).
+     * A column always lies in the same block across steps, so a per-block
+     * last-writer is an exact dependency.  Per step k: REFL(k) (1), the critical
+     * column k+1 (1, crit), and one chunk task per block intersecting [k+2,n).
+     * Loose upper bound on task count: */
+    int nblk = (n + C - 1) / C;
+    int tmax = n + n /*crit cols*/ + n * (nblk + 1) + 8;
+    /* edge bound: <=2 per task, plus up to C extra per dirty-block fallback
+     * (once per step) -> 3*tmax + n*C is safe. */
+    size_t emax = (size_t)3 * tmax + (size_t)n * C + 16;
     ccq.task = (CTask*)calloc(tmax, sizeof(CTask));
-    ccq_esrc = (int*)malloc((size_t)3 * tmax * sizeof(int));
-    ccq_edst = (int*)malloc((size_t)3 * tmax * sizeof(int));
-    int* lw = (int*)malloc((size_t)n * sizeof(int));   /* last writer per column */
+    ccq_esrc = (int*)malloc(emax * sizeof(int));
+    ccq_edst = (int*)malloc(emax * sizeof(int));
+    int* lw  = (int*)malloc((size_t)n * sizeof(int));    /* last writer per column */
+    int* lwb = (int*)malloc((size_t)nblk * sizeof(int)); /* last writer per block  */
     for (int j = 0; j < n; j++) lw[j] = -1;
+    for (int b = 0; b < nblk; b++) lwb[b] = -1;
     int nt_ = 0; ccq_ne = 0;
 
     for (int k = 0; k < n; k++) {
@@ -730,14 +746,39 @@ static void ccq_build_dag(int n) {
         ccq.task[rid].kind = CK_REFL; ccq.task[rid].k = k; ccq.task[rid].crit = 1;
         ccq_add_edge(lw[k], rid);
         lw[k] = rid;                              /* REFL writes column k diag */
-        /* UPD(k,j) for j>k: depends on REFL(k) and column j's last writer */
-        for (int j = k + 1; j < n; j++) {
+
+        /* critical column k+1 (single, main executes) */
+        if (k + 1 < n) {
+            int cid = nt_++;
+            ccq.task[cid].kind = CK_UPD; ccq.task[cid].k = k;
+            ccq.task[cid].j = k + 1; ccq.task[cid].jend = k + 2; ccq.task[cid].crit = 1;
+            ccq_add_edge(rid, cid);
+            ccq_add_edge(lw[k + 1], cid);
+            lw[k + 1] = cid;
+            int b = (k + 1) / C; lwb[b] = -2;     /* mark block dirty (mixed writer) */
+        }
+
+        /* non-critical columns [k+2, n) as C-aligned chunk tasks */
+        int start = k + 2;
+        for (int j = start; j < n; ) {
+            int b = j / C;
+            int bend = (b + 1) * C; if (bend > n) bend = n;   /* block end */
+            int je = bend;                                     /* this task covers [j,je) */
             int uid = nt_++;
-            ccq.task[uid].kind = CK_UPD; ccq.task[uid].k = k; ccq.task[uid].j = j;
-            ccq.task[uid].crit = (j == k + 1);    /* critical column = k+1 */
+            ccq.task[uid].kind = CK_UPD; ccq.task[uid].k = k;
+            ccq.task[uid].j = j; ccq.task[uid].jend = je; ccq.task[uid].crit = 0;
             ccq_add_edge(rid, uid);
-            ccq_add_edge(lw[j], uid);
-            lw[j] = uid;
+            /* predecessor = last writer of this block; if the block was last
+             * touched column-wise (dirty, -2), fall back to per-column writers
+             * so we never miss an edge. */
+            if (lwb[b] == -2) {
+                for (int c = j; c < je; c++) ccq_add_edge(lw[c], uid);
+            } else {
+                ccq_add_edge(lwb[b], uid);
+            }
+            for (int c = j; c < je; c++) lw[c] = uid;
+            lwb[b] = uid;
+            j = je;
         }
     }
     ccq.ntask = nt_;
@@ -752,7 +793,7 @@ static void ccq_build_dag(int n) {
     for (int x = 0; x < nt_; x++) cur[x] = ccq.task[x].soff;
     for (int e = 0; e < ccq_ne; e++) ccq.succ[cur[ccq_esrc[e]]++] = ccq_edst[e];
     for (int x = 0; x < nt_; x++) ccq.task[x].pred = ccq.task[x].npred;
-    free(lw); free(cur); free(ccq_esrc); free(ccq_edst);
+    free(lw); free(lwb); free(cur); free(ccq_esrc); free(ccq_edst);
 }
 
 static void qr_dag_cc_queue(Matrix* A, int nt) {
@@ -882,7 +923,8 @@ int main(void) {
     if      (sched == SCHED_BARRIER)       qr_dag_barrier(&A_alg, chunk);
     else if (sched == SCHED_ASYNC)         qr_dag_async(&A_alg, chunk, 0);  /* no priority */
     else if (sched == SCHED_ASYNC_PRIO_CC) qr_dag_async_prio_cc(&A_alg, chunk); /* concurrent crit col */
-    else if (sched == SCHED_CC_QUEUE)      qr_dag_cc_queue(&A_alg, nt);     /* concurrent queue */
+    else if (sched == SCHED_CC_QUEUE)      { g_ccq_chunk = (chunk > 0 ? chunk : 8);
+                                             qr_dag_cc_queue(&A_alg, nt); }   /* concurrent queue, chunk=C */
     else                                   qr_dag_async(&A_alg, chunk, 1);  /* async_prio */
     uint64_t t3 = get_cycles();
     if (use_signal_pool) pool_shutdown();
