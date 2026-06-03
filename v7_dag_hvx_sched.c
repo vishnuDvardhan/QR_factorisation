@@ -70,7 +70,12 @@ unsigned int heapSize = 16777216;
 #define DEFAULT_NB      8
 
 enum { SCHED_ASYNC_PRIO = 0, SCHED_BARRIER = 1, SCHED_ASYNC = 2,
-       SCHED_ASYNC_PRIO_CC = 3, SCHED_CC_QUEUE = 4 };
+       SCHED_ASYNC_PRIO_CC = 3, SCHED_CC_QUEUE = 4,
+       /* async_prio with the reflector computed on HVX (serial, in the
+        * critical-column lock window) instead of scalar-overlapped.  Helps
+        * when the reflector is exposed on the critical path (square / small m);
+        * hurts when workers fully hide it (tall / large m). */
+       SCHED_ASYNC_PRIO_HVX = 5 };
 
 static const char* VARIANT_NAME = "dag_hvx_sched";
 
@@ -181,6 +186,40 @@ static int compute_reflector(Matrix* A, int m, int k,
     v[k] -= alpha;
     float nvsq = 0.f;
     for (int i = k; i < m; i++) nvsq += v[i]*v[i];
+    if (nvsq < 1e-10f) { *tau_out = 0.f; return 0; }
+    *alpha_out = alpha;
+    *tau_out   = 2.f / nvsq;
+    return 1;
+}
+
+/* compute_reflector_hvx — same result as compute_reflector, but the two O(m)
+ * norm reductions run on HVX.  The CALLER MUST already hold an HVX context
+ * (hvx_col_norm_sq assumes it).  Used by the async_prio_cc scheduler, where
+ * main holds a context across the whole critical path: this fills that
+ * otherwise-idle context with useful work and accelerates the critical path
+ * (the reflector chain) directly — the win is largest on tall-skinny, where
+ * the reflector cost (proportional to m) dominates.
+ *
+ * Numerically ADDITION-ONLY (no cancellation, even when m-k is small):
+ *   ||A[k:m,k]||^2 = scalar head over the unaligned prefix [k,k_up) (<=31
+ *                    terms) + HVX over the lane-aligned bulk [k_up,m).
+ *   ||v||^2        = full lane-aligned [0,m) HVX reduction (v[0:k) are zeroed
+ *                    below, so this is exact). */
+static int compute_reflector_hvx(Matrix* A, int m, int k,
+                                 float* v, float* alpha_out, float* tau_out) {
+    const float* col_k = &MAT(*A, 0, k);
+    int k_up = (k + HVX_FLOAT_LANES - 1) & ~(HVX_FLOAT_LANES - 1);
+    if (k_up > m) k_up = m;
+    float nxsq = 0.f;
+    for (int i = k; i < k_up; i++) nxsq += col_k[i] * col_k[i];   /* head, <=31 */
+    if (k_up < m) nxsq += hvx_col_norm_sq(col_k, m, k_up);        /* aligned bulk */
+    float nx = sqrtf(nxsq);
+    if (nx < 1e-7f) { *tau_out = 0.f; return 0; }
+    float alpha = -(MAT(*A, k, k) >= 0.f ? 1.f : -1.f) * nx;
+    for (int i = 0; i < k; i++) v[i] = 0.f;
+    for (int i = k; i < m; i++) v[i] = MAT(*A, i, k);
+    v[k] -= alpha;
+    float nvsq = hvx_vec_norm_sq(v, m, 0);                        /* full [0,m) HVX */
     if (nvsq < 1e-10f) { *tau_out = 0.f; return 0; }
     *alpha_out = alpha;
     *tau_out   = 2.f / nvsq;
@@ -403,7 +442,7 @@ static void pool_wait_done(void) {
  * work or sleeps.  Workers get ALL HVX contexts; the main thread only locks a
  * context *briefly* for the critical column in the prio path, when no worker
  * is active. */
-static void qr_dag_async(Matrix* A, int chunk_size, int prio) {
+static void qr_dag_async(Matrix* A, int chunk_size, int prio, int hvx_reflector) {
     int m = A->m, n = A->n;
     float* vbuf[2];
     float  tau[2], alpha[2];
@@ -420,6 +459,7 @@ static void qr_dag_async(Matrix* A, int chunk_size, int prio) {
     for (int k = 0; k < n; k++) {
         int nxt = cur ^ 1;
         int dispatched = 0;
+        int reflector_done = 0;   /* set if the HVX reflector ran in-window */
         /* prio: main does the critical col k+1 itself, workers take [k+2,n).
          * non-prio: main does no special column, workers take all of [k+1,n). */
         int col_first = prio ? (k + 2) : (k + 1);
@@ -429,6 +469,17 @@ static void qr_dag_async(Matrix* A, int chunk_size, int prio) {
              * while no workers hold a context (prev step already joined). */
             if (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK) {
                 apply_col_hvx(A, vbuf[cur], tau[cur], k + 1, m);
+                /* hvx_reflector mode: reflector k+1 reads the column we just
+                 * finalised, so compute it HERE on the held context (HVX norms),
+                 * before releasing the context to the workers.  This trades the
+                 * scalar-reflector/worker OVERLAP for a faster but SERIAL HVX
+                 * reflector — a win only when the reflector (not the trailing
+                 * update) gates the step (square / small m). */
+                if (hvx_reflector && k + 1 < n) {
+                    valid[nxt] = compute_reflector_hvx(A, m, k + 1, vbuf[nxt],
+                                                       &alpha[nxt], &tau[nxt]);
+                    reflector_done = 1;
+                }
                 qurt_hvx_unlock();
             } else {
                 apply_col_scalar(A, vbuf[cur], tau[cur], k + 1, m);
@@ -446,7 +497,7 @@ static void qr_dag_async(Matrix* A, int chunk_size, int prio) {
          * avoid reading a half-updated column — overlap is therefore only
          * available to the priority policy. */
         if (prio) {
-            if (k + 1 < n)
+            if (k + 1 < n && !reflector_done)   /* scalar fallback (lock failed) */
                 valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
                                                &alpha[nxt], &tau[nxt]);
             if (dispatched) pool_wait_done();
@@ -496,7 +547,12 @@ static void qr_dag_async_prio_cc(Matrix* A, int chunk_size) {
      * up front, and hold it for the entire k-loop. */
     int main_hvx = (qurt_hvx_lock(QURT_HVX_MODE_128B) == QURT_EOK);
 
-    valid[cur] = compute_reflector(A, m, 0, vbuf[cur], &alpha[cur], &tau[cur]);
+    /* With the context held, compute the reflector (the critical path) on HVX
+     * too — otherwise main's reserved context sits idle through a scalar norm
+     * while workers are down one context.  Scalar fallback if the lock failed. */
+    valid[cur] = main_hvx
+        ? compute_reflector_hvx(A, m, 0, vbuf[cur], &alpha[cur], &tau[cur])
+        : compute_reflector(A, m, 0, vbuf[cur], &alpha[cur], &tau[cur]);
 
     for (int k = 0; k < n; k++) {
         int nxt = cur ^ 1;
@@ -513,8 +569,11 @@ static void qr_dag_async_prio_cc(Matrix* A, int chunk_size) {
                                                    k + 2, n, chunk_size, +1);
 
         if (k + 1 < n)
-            valid[nxt] = compute_reflector(A, m, k + 1, vbuf[nxt],
-                                           &alpha[nxt], &tau[nxt]);
+            valid[nxt] = main_hvx
+                ? compute_reflector_hvx(A, m, k + 1, vbuf[nxt],
+                                        &alpha[nxt], &tau[nxt])
+                : compute_reflector(A, m, k + 1, vbuf[nxt],
+                                    &alpha[nxt], &tau[nxt]);
 
         if (dispatched) pool_wait_done();
 
@@ -907,6 +966,7 @@ int main(void) {
     const char* sched_name = (sched == SCHED_BARRIER)        ? "barrier" :
                              (sched == SCHED_ASYNC)          ? "async"   :
                              (sched == SCHED_ASYNC_PRIO_CC)  ? "async_prio_cc" :
+                             (sched == SCHED_ASYNC_PRIO_HVX) ? "async_prio_hvx" :
                              (sched == SCHED_CC_QUEUE)       ? "cc_queue" :
                                                                "async_prio";
     printf("=== %s [%s] ===\n", VARIANT_NAME, sched_name);
@@ -931,14 +991,15 @@ int main(void) {
     printf("[alg] %s [%s] ... ", VARIANT_NAME, sched_name);
     uint64_t t2 = get_cycles();
     if      (sched == SCHED_BARRIER)       qr_dag_barrier(&A_alg, chunk);
-    else if (sched == SCHED_ASYNC)         qr_dag_async(&A_alg, chunk, 0);  /* no priority */
+    else if (sched == SCHED_ASYNC)         qr_dag_async(&A_alg, chunk, 0, 0);  /* no priority */
     else if (sched == SCHED_ASYNC_PRIO_CC) qr_dag_async_prio_cc(&A_alg, chunk); /* concurrent crit col */
+    else if (sched == SCHED_ASYNC_PRIO_HVX) qr_dag_async(&A_alg, chunk, 1, 1); /* async_prio, HVX reflector */
     else if (sched == SCHED_CC_QUEUE)      { g_ccq_chunk = (chunk > 0 ? chunk : 8);
                                              /* nb==1 forces main to HOLD a context; any other
                                               * value uses the default (release = faster here). */
                                              g_ccq_main_hvx = (nb == 1);
                                              qr_dag_cc_queue(&A_alg, nt); }   /* concurrent queue */
-    else                                   qr_dag_async(&A_alg, chunk, 1);  /* async_prio */
+    else                                   qr_dag_async(&A_alg, chunk, 1, 0);  /* async_prio (scalar reflector) */
     uint64_t t3 = get_cycles();
     if (use_signal_pool) pool_shutdown();
 
